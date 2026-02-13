@@ -1,0 +1,226 @@
+#include <SPI.h>
+#include <TFT_eSPI.h>
+
+TFT_eSPI tft = TFT_eSPI();
+
+// --- PINS --- A-CLK    B-DT
+// DUTY ENCODER (Knob 1)
+#define ENC_DUTY_A 6
+#define ENC_DUTY_B 7
+#define ENC_DUTY_SW 4
+
+// FREQ ENCODER (Knob 2)
+#define ENC_FREQ_A 15
+#define ENC_FREQ_B 16
+#define ENC_FREQ_SW 17
+
+// --- PWM OUTPUT PIN (DO NOT use your TFT SPI pins) ---
+#define PWM_OUT_PIN 8
+
+// --- LEDC (ESP32 PWM) SETTINGS ---
+const int PWM_RES_BITS = 10;                 // 10-bit resolution (0..1023)
+const int PWM_MAX = (1 << PWM_RES_BITS) - 1; // 1023
+
+// --- STATE VARIABLES ---
+int dutyCycle = 50;
+long frequency = 1000;     // knob 2 edits this now
+bool extSource = false;
+bool altMode = false;
+bool isConnected = false;
+
+// --- ENCODER EDGE STATE ---
+int lastDutyA = HIGH;
+int lastFreqA = HIGH;
+
+unsigned long lastTempSend = 0;
+
+// ---------- PWM APPLY ----------
+void applyPwm() {
+  long f = constrain(frequency, 1, 100000);
+  int d  = constrain(dutyCycle, 0, 100);
+
+  ledcAttach(PWM_OUT_PIN, (uint32_t)f, PWM_RES_BITS);
+
+  uint32_t dutyCounts = (uint32_t)((d * PWM_MAX) / 100);
+  ledcWrite(PWM_OUT_PIN, dutyCounts);
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENC_DUTY_A, INPUT_PULLUP);
+  pinMode(ENC_DUTY_B, INPUT_PULLUP);
+  pinMode(ENC_DUTY_SW, INPUT_PULLUP);
+
+  pinMode(ENC_FREQ_A, INPUT_PULLUP);
+  pinMode(ENC_FREQ_B, INPUT_PULLUP);
+  pinMode(ENC_FREQ_SW, INPUT_PULLUP);
+
+  lastDutyA = digitalRead(ENC_DUTY_A);
+  lastFreqA = digitalRead(ENC_FREQ_A);
+
+  applyPwm();
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  drawInterface();
+  drawStatusLight();
+  updateScreenValues();
+}
+
+// ---------- LOOP ----------
+void loop() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    parseCommand(command);
+  }
+
+  checkEncoders();
+
+  if (millis() - lastTempSend > 500) {
+    int simulatedTemp = 45;
+    Serial.print("TEMP:"); Serial.println(simulatedTemp);
+    lastTempSend = millis();
+  }
+}
+
+// ---------- ENCODERS ----------
+void checkEncoders() {
+  // --- DUTY KNOB (Knob 1) ---
+  int dutyA = digitalRead(ENC_DUTY_A);
+
+  if (lastDutyA == HIGH && dutyA == LOW) {
+    int dutyB = digitalRead(ENC_DUTY_B);
+
+    // Keep your original orientation:
+    if (dutyB == LOW) dutyCycle--;
+    else              dutyCycle++;
+
+    dutyCycle = constrain(dutyCycle, 0, 100);
+
+    applyPwm();
+    updateScreenValues();
+    Serial.print("DUTY:"); Serial.println(dutyCycle);
+
+    delay(1);
+  }
+  lastDutyA = dutyA;
+
+  // --- FREQ KNOB (Knob 2) ---
+  int freqA = digitalRead(ENC_FREQ_A);
+
+  if (lastFreqA == HIGH && freqA == LOW) {
+    int freqB = digitalRead(ENC_FREQ_B);
+
+    const long FREQ_STEP = 100;   // tune: 10, 50, 100, 500, 1000
+    const long FREQ_MIN  = 1;
+    const long FREQ_MAX  = 100000;
+
+    // Same direction logic style as duty knob:
+    if (freqB == LOW) frequency -= FREQ_STEP;
+    else              frequency += FREQ_STEP;
+
+    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
+
+    applyPwm();
+    updateScreenValues();
+    Serial.print("FREQ:"); Serial.println(frequency);
+
+    delay(1);
+  }
+
+  lastFreqA = freqA;
+}
+
+// ---------- SERIAL PARSE ----------
+void parseCommand(String cmd) {
+  cmd.trim();
+  int separator = cmd.indexOf(':');
+  if (separator == -1) return;
+
+  String type = cmd.substring(0, separator);
+  String val  = cmd.substring(separator + 1);
+
+  if (type == "DUTY") {
+    dutyCycle = constrain(val.toInt(), 0, 100);
+    applyPwm();
+    updateScreenValues();
+    Serial.print("DUTY:"); Serial.println(dutyCycle);
+  }
+  else if (type == "FREQ") {
+    frequency = constrain((long)val.toInt(), 1, 100000);
+    applyPwm();
+    updateScreenValues();
+    Serial.print("FREQ:"); Serial.println(frequency);
+  }
+  else if (type == "SOURCE") {
+    extSource = (val == "EXT");
+    updateScreenValues();
+  }
+  else if (type == "FET2") {
+    altMode = (val == "ALT");
+    updateScreenValues();
+  }
+  else if (type == "CONN") {
+    isConnected = (val == "ON");
+    drawStatusLight();
+  }
+}
+
+// ---------- DRAWING ----------
+void updateScreenValues() {
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+
+  tft.setCursor(80, 60);  tft.print("     ");
+  tft.setCursor(80, 60);  tft.print(dutyCycle); tft.print(" %");
+
+  tft.setCursor(80, 100); tft.print("        ");
+  tft.setCursor(80, 100); tft.print(frequency); tft.print(" Hz");
+
+  tft.setCursor(80, 140); tft.print("        ");
+  tft.setCursor(80, 140);
+  if (extSource) tft.print("EXTERNAL");
+  else           tft.print("INTERNAL");
+
+  tft.setCursor(80, 180); tft.print("          ");
+  tft.setCursor(80, 180);
+  if (altMode) tft.print("ALTERNATE");
+  else         tft.print("COPY (q)");
+}
+
+void drawStatusLight() {
+  int x = 300, y = 20, radius = 8;
+  tft.fillRect(250, 10, 70, 20, TFT_BLUE);
+
+  if (isConnected) {
+    tft.fillCircle(x, y, radius, TFT_GREEN);
+    tft.setTextColor(TFT_GREEN, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setCursor(260, 15);
+    tft.print("LINK OK");
+  } else {
+    tft.fillCircle(x, y, radius, TFT_RED);
+    tft.setTextColor(TFT_RED, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setCursor(260, 15);
+    tft.print("NO LINK");
+  }
+}
+
+void drawInterface() {
+  tft.fillRect(0, 0, 320, 40, TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("FET BOX CONTROL");
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(10, 60);  tft.print("Duty:");
+  tft.setCursor(10, 100); tft.print("Freq:");
+  tft.setCursor(10, 140); tft.print("Src:");
+  tft.setCursor(10, 180); tft.print("FET2:");
+}
