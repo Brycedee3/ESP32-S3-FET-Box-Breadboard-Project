@@ -7,7 +7,7 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-// --- PINS --- A-CLK    B-DT
+// --- PINS ---
 // DUTY ENCODER (Knob 1)
 #define ENC_DUTY_A 6
 #define ENC_DUTY_B 7
@@ -18,10 +18,10 @@ TFT_eSPI tft = TFT_eSPI();
 #define ENC_FREQ_B 16
 #define ENC_FREQ_SW 17
 
-// --- PWM OUTPUT PIN (DO NOT use your TFT SPI pins) ---
+// --- PWM OUTPUT PIN ---
 #define PWM_OUT_PIN 8
 
-// --- DS18B20 DATA PIN (choose a free GPIO; avoid input-only pins like 46) ---
+// --- DS18B20 DATA PIN ---
 #define DS18B20_PIN 18
 
 // --- LEDC (ESP32 PWM) SETTINGS ---
@@ -39,6 +39,9 @@ bool extSource = false;
 bool altMode = false;
 bool isConnected = false;
 
+// --- WATCHDOG TIMER (NEW) ---
+unsigned long lastHeartbeatTime = 0; 
+
 // Temperature state
 float tempC = NAN;
 bool tempOk = false;
@@ -54,74 +57,14 @@ void applyPwm() {
   long f = constrain(frequency, 1, 100000);
   int d  = constrain(dutyCycle, 0, 100);
 
+  // Note: Ensure your ESP32 board version supports this syntax (v3.0+)
   ledcAttach(PWM_OUT_PIN, (uint32_t)f, PWM_RES_BITS);
 
   uint32_t dutyCounts = (uint32_t)((d * PWM_MAX) / 100);
   ledcWrite(PWM_OUT_PIN, dutyCounts);
 }
 
-// ---------- TEMPERATURE ----------
-void initTempSensor() {
-  sensors.begin();
-  // Non-blocking conversions; we will request->later read
-  sensors.setWaitForConversion(false);
-  sensors.requestTemperatures(); // start first conversion
-}
-
-void pollTemperature() {
-  // Read the last completed conversion
-  float t = sensors.getTempCByIndex(0);
-
-  if (t == DEVICE_DISCONNECTED_C) {
-    tempOk = false;
-  } else {
-    tempOk = true;
-    tempC = t;
-  }
-
-  // Start next conversion for next poll
-  sensors.requestTemperatures();
-}
-
-void updateTempOnScreen() {
-  // Clear previous value region then print new one
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-
-  // Value area (aligned with other fields at x=80)
-  tft.setCursor(80, 220);
-  tft.print("            ");   // clear
-  tft.setCursor(80, 220);
-
-  if (!tempOk) {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.print("SENSOR ERR");
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  } else {
-    // Print like "24.63 C"
-    tft.print(tempC, 2);
-    tft.print(" C");
-  }
-}
-
-// ---------- UI ----------
-void drawInterface() {
-  tft.fillRect(0, 0, 320, 40, TFT_BLUE);
-  tft.setTextColor(TFT_WHITE, TFT_BLUE);
-  tft.setTextSize(2);
-  tft.setCursor(10, 10);
-  tft.println("FET BOX CONTROL");
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(2);
-
-  tft.setCursor(10, 60);   tft.print("Duty:");
-  tft.setCursor(10, 100);  tft.print("Freq:");
-  tft.setCursor(10, 140);  tft.print("Src:");
-  tft.setCursor(10, 180);  tft.print("FET2:");
-  tft.setCursor(10, 220);  tft.print("Temp:");
-}
-
+// ---------- UI DRAWING ----------
 void drawStatusLight() {
   int x = 300, y = 20, radius = 8;
   tft.fillRect(250, 10, 70, 20, TFT_BLUE);
@@ -166,6 +109,60 @@ void updateScreenValues() {
   else         tft.print("COPY (q)");
 }
 
+void drawInterface() {
+  tft.fillRect(0, 0, 320, 40, TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("FET BOX CONTROL");
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+
+  tft.setCursor(10, 60);   tft.print("Duty:");
+  tft.setCursor(10, 100);  tft.print("Freq:");
+  tft.setCursor(10, 140);  tft.print("Src:");
+  tft.setCursor(10, 180);  tft.print("FET2:");
+  tft.setCursor(10, 220);  tft.print("Temp:");
+}
+
+// ---------- TEMPERATURE ----------
+void initTempSensor() {
+  sensors.begin();
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures(); 
+}
+
+void pollTemperature() {
+  float t = sensors.getTempCByIndex(0);
+
+  if (t == DEVICE_DISCONNECTED_C) {
+    tempOk = false;
+  } else {
+    tempOk = true;
+    tempC = t;
+  }
+  sensors.requestTemperatures();
+}
+
+void updateTempOnScreen() {
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+
+  tft.setCursor(80, 220);
+  tft.print("            "); 
+  tft.setCursor(80, 220);
+
+  if (!tempOk) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("SENSOR ERR");
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  } else {
+    tft.print(tempC, 2);
+    tft.print(" C");
+  }
+}
+
 // ---------- SERIAL PARSE ----------
 void parseCommand(String cmd) {
   cmd.trim();
@@ -197,53 +194,47 @@ void parseCommand(String cmd) {
   }
   else if (type == "CONN") {
     isConnected = (val == "ON");
+    if(isConnected) lastHeartbeatTime = millis(); // Reset timer immediately on connect
     drawStatusLight();
+  }
+  // --- NEW HEARTBEAT COMMAND ---
+  else if (type == "HEARTBEAT") {
+    lastHeartbeatTime = millis(); // Reset timer! We are safe.
   }
 }
 
 // ---------- ENCODERS ----------
 void checkEncoders() {
-  // --- DUTY KNOB (Knob 1) ---
+  // --- DUTY KNOB ---
   int dutyA = digitalRead(ENC_DUTY_A);
-
   if (lastDutyA == HIGH && dutyA == LOW) {
     int dutyB = digitalRead(ENC_DUTY_B);
-
     if (dutyB == LOW) dutyCycle--;
     else              dutyCycle++;
-
+    
     dutyCycle = constrain(dutyCycle, 0, 100);
-
     applyPwm();
     updateScreenValues();
     Serial.print("DUTY:"); Serial.println(dutyCycle);
-
     delay(1);
   }
   lastDutyA = dutyA;
 
-  // --- FREQ KNOB (Knob 2) ---
+  // --- FREQ KNOB ---
   int freqA = digitalRead(ENC_FREQ_A);
-
   if (lastFreqA == HIGH && freqA == LOW) {
     int freqB = digitalRead(ENC_FREQ_B);
-
     const long FREQ_STEP = 100;
-    const long FREQ_MIN  = 1;
-    const long FREQ_MAX  = 100000;
-
+    
     if (freqB == LOW) frequency -= FREQ_STEP;
     else              frequency += FREQ_STEP;
-
-    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
-
+    
+    frequency = constrain(frequency, 1, 100000);
     applyPwm();
     updateScreenValues();
     Serial.print("FREQ:"); Serial.println(frequency);
-
     delay(1);
   }
-
   lastFreqA = freqA;
 }
 
@@ -273,25 +264,57 @@ void setup() {
   updateScreenValues();
 
   initTempSensor();
-
-  // First temperature read will happen in loop after ~500ms
   updateTempOnScreen();
+  
+  // Prevent immediate shutdown on boot
+  lastHeartbeatTime = millis();
 }
 
 // ---------- LOOP ----------
 void loop() {
+  // 1. SERIAL INPUT
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     parseCommand(command);
   }
 
+  // 2. KNOBS
   checkEncoders();
 
-  // Temp poll/update every 500ms
+  // 3. SAFETY WATCHDOG (NEW!)
+  // If connected AND >2 seconds since last heartbeat...
+  if (isConnected && (millis() - lastHeartbeatTime > 2000)) {
+    // EMERGENCY SHUTDOWN
+    dutyCycle = 0;
+    applyPwm(); // Force Hardware to 0
+    isConnected = false; // Drop connection
+    
+    // RED SCREEN ALERT
+    tft.fillScreen(TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.setTextSize(3);
+    tft.setCursor(20, 100);
+    tft.print("LINK LOST!");
+    tft.setTextSize(2);
+    tft.setCursor(40, 150);
+    tft.print("Safety Shutdown");
+    
+    delay(2000); // Hold for 2 seconds
+    
+    // Restore Normal Screen
+    tft.fillScreen(TFT_BLACK);
+    drawInterface();
+    drawStatusLight();
+    updateScreenValues();
+    updateTempOnScreen();
+    
+    lastHeartbeatTime = millis(); // Reset timer
+  }
+
+  // 4. TEMP UPDATE (Every 500ms)
   if (millis() - lastTempUpdate > 500) {
     pollTemperature();
 
-    // Print to serial too (optional)
     if (!tempOk) Serial.println("TEMP:ERR");
     else {
       Serial.print("TEMP:");
