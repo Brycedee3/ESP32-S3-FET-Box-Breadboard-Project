@@ -22,7 +22,7 @@ TFT_eSPI tft = TFT_eSPI();
 #define PWM_OUT_PIN 8
 
 // --- DS18B20 DATA PIN (choose a free GPIO; avoid input-only pins like 46) ---
-#define DS18B20_PIN 13
+#define DS18B20_PIN 18
 
 // --- LEDC (ESP32 PWM) SETTINGS ---
 const int PWM_RES_BITS = 10;                 // 10-bit resolution (0..1023)
