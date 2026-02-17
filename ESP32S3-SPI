@@ -1,6 +1,10 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 
+// --- DS18B20 ---
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
 TFT_eSPI tft = TFT_eSPI();
 
 // --- PINS --- A-CLK    B-DT
@@ -17,9 +21,16 @@ TFT_eSPI tft = TFT_eSPI();
 // --- PWM OUTPUT PIN (DO NOT use your TFT SPI pins) ---
 #define PWM_OUT_PIN 8
 
+// --- DS18B20 DATA PIN (choose a free GPIO) ---
+#define DS18B20_PIN 13
+
 // --- LEDC (ESP32 PWM) SETTINGS ---
 const int PWM_RES_BITS = 10;                 // 10-bit resolution (0..1023)
 const int PWM_MAX = (1 << PWM_RES_BITS) - 1; // 1023
+
+// --- DS18B20 objects ---
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
 
 // --- STATE VARIABLES ---
 int dutyCycle = 50;
@@ -60,6 +71,10 @@ void setup() {
   lastDutyA = digitalRead(ENC_DUTY_A);
   lastFreqA = digitalRead(ENC_FREQ_A);
 
+  // --- DS18B20 init ---
+  sensors.begin();
+  sensors.setWaitForConversion(false); // non-blocking conversions (we'll read later)
+
   applyPwm();
 
   tft.init();
@@ -69,6 +84,9 @@ void setup() {
   drawInterface();
   drawStatusLight();
   updateScreenValues();
+
+  // Kick off first temperature conversion
+  sensors.requestTemperatures();
 }
 
 // ---------- LOOP ----------
@@ -80,9 +98,24 @@ void loop() {
 
   checkEncoders();
 
+  // Send temp every 500 ms
   if (millis() - lastTempSend > 500) {
-    int simulatedTemp = 45;
-    Serial.print("TEMP:"); Serial.println(simulatedTemp);
+    // Read the last completed conversion
+    float tempC = sensors.getTempCByIndex(0);
+
+    if (tempC == DEVICE_DISCONNECTED_C) {
+      Serial.println("TEMP:ERR");
+    } else {
+      // Start a new conversion for next time (non-blocking)
+      sensors.requestTemperatures();
+
+      // If you want Fahrenheit instead:
+      // float tempF = DallasTemperature::toFahrenheit(tempC);
+
+      Serial.print("TEMP:");
+      Serial.println(tempC, 2); // 2 decimals
+    }
+
     lastTempSend = millis();
   }
 }
