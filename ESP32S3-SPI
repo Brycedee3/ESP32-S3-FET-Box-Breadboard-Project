@@ -21,7 +21,7 @@ TFT_eSPI tft = TFT_eSPI();
 // --- PWM OUTPUT PIN (DO NOT use your TFT SPI pins) ---
 #define PWM_OUT_PIN 8
 
-// --- DS18B20 DATA PIN (choose a free GPIO) ---
+// --- DS18B20 DATA PIN (choose a free GPIO; avoid input-only pins like 46) ---
 #define DS18B20_PIN 13
 
 // --- LEDC (ESP32 PWM) SETTINGS ---
@@ -34,16 +34,20 @@ DallasTemperature sensors(&oneWire);
 
 // --- STATE VARIABLES ---
 int dutyCycle = 50;
-long frequency = 1000;     // knob 2 edits this now
+long frequency = 1000;
 bool extSource = false;
 bool altMode = false;
 bool isConnected = false;
+
+// Temperature state
+float tempC = NAN;
+bool tempOk = false;
 
 // --- ENCODER EDGE STATE ---
 int lastDutyA = HIGH;
 int lastFreqA = HIGH;
 
-unsigned long lastTempSend = 0;
+unsigned long lastTempUpdate = 0;
 
 // ---------- PWM APPLY ----------
 void applyPwm() {
@@ -56,116 +60,110 @@ void applyPwm() {
   ledcWrite(PWM_OUT_PIN, dutyCounts);
 }
 
-// ---------- SETUP ----------
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(ENC_DUTY_A, INPUT_PULLUP);
-  pinMode(ENC_DUTY_B, INPUT_PULLUP);
-  pinMode(ENC_DUTY_SW, INPUT_PULLUP);
-
-  pinMode(ENC_FREQ_A, INPUT_PULLUP);
-  pinMode(ENC_FREQ_B, INPUT_PULLUP);
-  pinMode(ENC_FREQ_SW, INPUT_PULLUP);
-
-  lastDutyA = digitalRead(ENC_DUTY_A);
-  lastFreqA = digitalRead(ENC_FREQ_A);
-
-  // --- DS18B20 init ---
+// ---------- TEMPERATURE ----------
+void initTempSensor() {
   sensors.begin();
-  sensors.setWaitForConversion(false); // non-blocking conversions (we'll read later)
+  // Non-blocking conversions; we will request->later read
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures(); // start first conversion
+}
 
-  applyPwm();
+void pollTemperature() {
+  // Read the last completed conversion
+  float t = sensors.getTempCByIndex(0);
 
-  tft.init();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
+  if (t == DEVICE_DISCONNECTED_C) {
+    tempOk = false;
+  } else {
+    tempOk = true;
+    tempC = t;
+  }
 
-  drawInterface();
-  drawStatusLight();
-  updateScreenValues();
-
-  // Kick off first temperature conversion
+  // Start next conversion for next poll
   sensors.requestTemperatures();
 }
 
-// ---------- LOOP ----------
-void loop() {
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    parseCommand(command);
-  }
+void updateTempOnScreen() {
+  // Clear previous value region then print new one
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
-  checkEncoders();
+  // Value area (aligned with other fields at x=80)
+  tft.setCursor(80, 220);
+  tft.print("            ");   // clear
+  tft.setCursor(80, 220);
 
-  // Send temp every 500 ms
-  if (millis() - lastTempSend > 500) {
-    // Read the last completed conversion
-    float tempC = sensors.getTempCByIndex(0);
-
-    if (tempC == DEVICE_DISCONNECTED_C) {
-      Serial.println("TEMP:ERR");
-    } else {
-      // Start a new conversion for next time (non-blocking)
-      sensors.requestTemperatures();
-
-      // If you want Fahrenheit instead:
-      // float tempF = DallasTemperature::toFahrenheit(tempC);
-
-      Serial.print("TEMP:");
-      Serial.println(tempC, 2); // 2 decimals
-    }
-
-    lastTempSend = millis();
+  if (!tempOk) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("SENSOR ERR");
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  } else {
+    // Print like "24.63 C"
+    tft.print(tempC, 2);
+    tft.print(" C");
   }
 }
 
-// ---------- ENCODERS ----------
-void checkEncoders() {
-  // --- DUTY KNOB (Knob 1) ---
-  int dutyA = digitalRead(ENC_DUTY_A);
+// ---------- UI ----------
+void drawInterface() {
+  tft.fillRect(0, 0, 320, 40, TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("FET BOX CONTROL");
 
-  if (lastDutyA == HIGH && dutyA == LOW) {
-    int dutyB = digitalRead(ENC_DUTY_B);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
 
-    // Keep your original orientation:
-    if (dutyB == LOW) dutyCycle--;
-    else              dutyCycle++;
+  tft.setCursor(10, 60);   tft.print("Duty:");
+  tft.setCursor(10, 100);  tft.print("Freq:");
+  tft.setCursor(10, 140);  tft.print("Src:");
+  tft.setCursor(10, 180);  tft.print("FET2:");
+  tft.setCursor(10, 220);  tft.print("Temp:");
+}
 
-    dutyCycle = constrain(dutyCycle, 0, 100);
+void drawStatusLight() {
+  int x = 300, y = 20, radius = 8;
+  tft.fillRect(250, 10, 70, 20, TFT_BLUE);
 
-    applyPwm();
-    updateScreenValues();
-    Serial.print("DUTY:"); Serial.println(dutyCycle);
-
-    delay(1);
+  if (isConnected) {
+    tft.fillCircle(x, y, radius, TFT_GREEN);
+    tft.setTextColor(TFT_GREEN, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setCursor(260, 15);
+    tft.print("LINK OK");
+  } else {
+    tft.fillCircle(x, y, radius, TFT_RED);
+    tft.setTextColor(TFT_RED, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setCursor(260, 15);
+    tft.print("NO LINK");
   }
-  lastDutyA = dutyA;
+}
 
-  // --- FREQ KNOB (Knob 2) ---
-  int freqA = digitalRead(ENC_FREQ_A);
+void updateScreenValues() {
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
-  if (lastFreqA == HIGH && freqA == LOW) {
-    int freqB = digitalRead(ENC_FREQ_B);
+  // Duty
+  tft.setCursor(80, 60);  tft.print("     ");
+  tft.setCursor(80, 60);  tft.print(dutyCycle); tft.print(" %");
 
-    const long FREQ_STEP = 100;   // tune: 10, 50, 100, 500, 1000
-    const long FREQ_MIN  = 1;
-    const long FREQ_MAX  = 100000;
+  // Freq
+  tft.setCursor(80, 100); tft.print("        ");
+  tft.setCursor(80, 100); tft.print(frequency); tft.print(" Hz");
 
-    // Same direction logic style as duty knob:
-    if (freqB == LOW) frequency -= FREQ_STEP;
-    else              frequency += FREQ_STEP;
+  // Source
+  tft.setCursor(80, 140); tft.print("        ");
+  tft.setCursor(80, 140);
+  if (extSource) tft.print("EXTERNAL");
+  else           tft.print("INTERNAL");
 
-    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
-
-    applyPwm();
-    updateScreenValues();
-    Serial.print("FREQ:"); Serial.println(frequency);
-
-    delay(1);
-  }
-
-  lastFreqA = freqA;
+  // FET2 mode
+  tft.setCursor(80, 180); tft.print("          ");
+  tft.setCursor(80, 180);
+  if (altMode) tft.print("ALTERNATE");
+  else         tft.print("COPY (q)");
 }
 
 // ---------- SERIAL PARSE ----------
@@ -203,57 +201,104 @@ void parseCommand(String cmd) {
   }
 }
 
-// ---------- DRAWING ----------
-void updateScreenValues() {
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+// ---------- ENCODERS ----------
+void checkEncoders() {
+  // --- DUTY KNOB (Knob 1) ---
+  int dutyA = digitalRead(ENC_DUTY_A);
 
-  tft.setCursor(80, 60);  tft.print("     ");
-  tft.setCursor(80, 60);  tft.print(dutyCycle); tft.print(" %");
+  if (lastDutyA == HIGH && dutyA == LOW) {
+    int dutyB = digitalRead(ENC_DUTY_B);
 
-  tft.setCursor(80, 100); tft.print("        ");
-  tft.setCursor(80, 100); tft.print(frequency); tft.print(" Hz");
+    if (dutyB == LOW) dutyCycle--;
+    else              dutyCycle++;
 
-  tft.setCursor(80, 140); tft.print("        ");
-  tft.setCursor(80, 140);
-  if (extSource) tft.print("EXTERNAL");
-  else           tft.print("INTERNAL");
+    dutyCycle = constrain(dutyCycle, 0, 100);
 
-  tft.setCursor(80, 180); tft.print("          ");
-  tft.setCursor(80, 180);
-  if (altMode) tft.print("ALTERNATE");
-  else         tft.print("COPY (q)");
-}
+    applyPwm();
+    updateScreenValues();
+    Serial.print("DUTY:"); Serial.println(dutyCycle);
 
-void drawStatusLight() {
-  int x = 300, y = 20, radius = 8;
-  tft.fillRect(250, 10, 70, 20, TFT_BLUE);
-
-  if (isConnected) {
-    tft.fillCircle(x, y, radius, TFT_GREEN);
-    tft.setTextColor(TFT_GREEN, TFT_BLUE);
-    tft.setTextSize(1);
-    tft.setCursor(260, 15);
-    tft.print("LINK OK");
-  } else {
-    tft.fillCircle(x, y, radius, TFT_RED);
-    tft.setTextColor(TFT_RED, TFT_BLUE);
-    tft.setTextSize(1);
-    tft.setCursor(260, 15);
-    tft.print("NO LINK");
+    delay(1);
   }
+  lastDutyA = dutyA;
+
+  // --- FREQ KNOB (Knob 2) ---
+  int freqA = digitalRead(ENC_FREQ_A);
+
+  if (lastFreqA == HIGH && freqA == LOW) {
+    int freqB = digitalRead(ENC_FREQ_B);
+
+    const long FREQ_STEP = 100;
+    const long FREQ_MIN  = 1;
+    const long FREQ_MAX  = 100000;
+
+    if (freqB == LOW) frequency -= FREQ_STEP;
+    else              frequency += FREQ_STEP;
+
+    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
+
+    applyPwm();
+    updateScreenValues();
+    Serial.print("FREQ:"); Serial.println(frequency);
+
+    delay(1);
+  }
+
+  lastFreqA = freqA;
 }
 
-void drawInterface() {
-  tft.fillRect(0, 0, 320, 40, TFT_BLUE);
-  tft.setTextColor(TFT_WHITE, TFT_BLUE);
-  tft.setTextSize(2);
-  tft.setCursor(10, 10);
-  tft.println("FET BOX CONTROL");
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
 
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 60);  tft.print("Duty:");
-  tft.setCursor(10, 100); tft.print("Freq:");
-  tft.setCursor(10, 140); tft.print("Src:");
-  tft.setCursor(10, 180); tft.print("FET2:");
+  pinMode(ENC_DUTY_A, INPUT_PULLUP);
+  pinMode(ENC_DUTY_B, INPUT_PULLUP);
+  pinMode(ENC_DUTY_SW, INPUT_PULLUP);
+
+  pinMode(ENC_FREQ_A, INPUT_PULLUP);
+  pinMode(ENC_FREQ_B, INPUT_PULLUP);
+  pinMode(ENC_FREQ_SW, INPUT_PULLUP);
+
+  lastDutyA = digitalRead(ENC_DUTY_A);
+  lastFreqA = digitalRead(ENC_FREQ_A);
+
+  applyPwm();
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  drawInterface();
+  drawStatusLight();
+  updateScreenValues();
+
+  initTempSensor();
+
+  // First temperature read will happen in loop after ~500ms
+  updateTempOnScreen();
+}
+
+// ---------- LOOP ----------
+void loop() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    parseCommand(command);
+  }
+
+  checkEncoders();
+
+  // Temp poll/update every 500ms
+  if (millis() - lastTempUpdate > 500) {
+    pollTemperature();
+
+    // Print to serial too (optional)
+    if (!tempOk) Serial.println("TEMP:ERR");
+    else {
+      Serial.print("TEMP:");
+      Serial.println(tempC, 2);
+    }
+
+    updateTempOnScreen();
+    lastTempUpdate = millis();
+  }
 }
