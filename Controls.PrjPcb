@@ -324,7 +324,7 @@ GenerateClassCluster=0
 DocumentUniqueId=DRTTYBPE
 
 [Document17]
-DocumentPath=..\FET\UPDATED PARTS\Controls\Control PCB.PcbDoc
+DocumentPath=Control PCB.PcbDoc
 AnnotationEnabled=1
 AnnotateStartValue=1
 AnnotationIndexControlEnabled=0
@@ -341,7 +341,7 @@ GenerateClassCluster=0
 DocumentUniqueId=OCFHFAIQ
 
 [Document18]
-DocumentPath=..\FET\UPDATED PARTS\Controls\FET 1 and FET 2 Isolated Gate Drive.SchDoc
+DocumentPath=FET 1 and FET 2 Isolated Gate Drive.SchDoc
 AnnotationEnabled=1
 AnnotateStartValue=1
 AnnotationIndexControlEnabled=0
@@ -358,7 +358,7 @@ GenerateClassCluster=0
 DocumentUniqueId=TVJFWLOA
 
 [Document19]
-DocumentPath=..\FET\UPDATED PARTS\Controls\PWM Generation.SchDoc
+DocumentPath=PWM Generation.SchDoc
 AnnotationEnabled=1
 AnnotateStartValue=1
 AnnotationIndexControlEnabled=0
@@ -393,6 +393,23 @@ DocumentUniqueId=
 
 [Document21]
 DocumentPath=Control PCB Gerbel.Cam
+AnnotationEnabled=1
+AnnotateStartValue=1
+AnnotationIndexControlEnabled=0
+AnnotateSuffix=
+AnnotateScope=All
+AnnotateOrder=-1
+DoLibraryUpdate=1
+DoDatabaseUpdate=1
+ClassGenCCAutoEnabled=1
+ClassGenCCAutoRoomEnabled=0
+ClassGenNCAutoScope=None
+DItemRevisionGUID=
+GenerateClassCluster=0
+DocumentUniqueId=
+
+[Document22]
+DocumentPath=Controls.BomDoc
 AnnotationEnabled=1
 AnnotateStartValue=1
 AnnotationIndexControlEnabled=0
