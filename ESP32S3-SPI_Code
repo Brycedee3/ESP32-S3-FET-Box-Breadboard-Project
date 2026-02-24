@@ -25,6 +25,7 @@ TFT_eSPI tft = TFT_eSPI();
 #define DS18B20_PIN 18
 
 // --- LEDC (ESP32 PWM) SETTINGS ---
+const int PWM_CH = 0;                        // PWM channel (0..15 typical)
 const int PWM_RES_BITS = 10;                 // 10-bit resolution (0..1023)
 const int PWM_MAX = (1 << PWM_RES_BITS) - 1; // 1023
 
@@ -40,7 +41,7 @@ bool altMode = false;
 bool isConnected = false;
 
 // --- WATCHDOG TIMER (NEW) ---
-unsigned long lastHeartbeatTime = 0; 
+unsigned long lastHeartbeatTime = 0;
 
 // Temperature state
 float tempC = NAN;
@@ -57,10 +58,13 @@ void applyPwm() {
   long f = constrain(frequency, 1, 100000);
   int d  = constrain(dutyCycle, 0, 100);
 
-  // Note: Ensure your ESP32 board version supports this syntax (v3.0+)
+  // Attach PWM to the pin with desired frequency and resolution
   ledcAttach(PWM_OUT_PIN, (uint32_t)f, PWM_RES_BITS);
 
+  // Convert percent to raw counts
   uint32_t dutyCounts = (uint32_t)((d * PWM_MAX) / 100);
+
+  // Write duty directly to the PIN (not channel!)
   ledcWrite(PWM_OUT_PIN, dutyCounts);
 }
 
@@ -130,7 +134,7 @@ void drawInterface() {
 void initTempSensor() {
   sensors.begin();
   sensors.setWaitForConversion(false);
-  sensors.requestTemperatures(); 
+  sensors.requestTemperatures();
 }
 
 void pollTemperature() {
@@ -150,7 +154,7 @@ void updateTempOnScreen() {
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
   tft.setCursor(80, 220);
-  tft.print("            "); 
+  tft.print("            ");
   tft.setCursor(80, 220);
 
   if (!tempOk) {
@@ -194,12 +198,11 @@ void parseCommand(String cmd) {
   }
   else if (type == "CONN") {
     isConnected = (val == "ON");
-    if(isConnected) lastHeartbeatTime = millis(); // Reset timer immediately on connect
+    if (isConnected) lastHeartbeatTime = millis();
     drawStatusLight();
   }
-  // --- NEW HEARTBEAT COMMAND ---
   else if (type == "HEARTBEAT") {
-    lastHeartbeatTime = millis(); // Reset timer! We are safe.
+    lastHeartbeatTime = millis();
   }
 }
 
@@ -211,7 +214,7 @@ void checkEncoders() {
     int dutyB = digitalRead(ENC_DUTY_B);
     if (dutyB == LOW) dutyCycle--;
     else              dutyCycle++;
-    
+
     dutyCycle = constrain(dutyCycle, 0, 100);
     applyPwm();
     updateScreenValues();
@@ -225,10 +228,10 @@ void checkEncoders() {
   if (lastFreqA == HIGH && freqA == LOW) {
     int freqB = digitalRead(ENC_FREQ_B);
     const long FREQ_STEP = 100;
-    
+
     if (freqB == LOW) frequency -= FREQ_STEP;
     else              frequency += FREQ_STEP;
-    
+
     frequency = constrain(frequency, 1, 100000);
     applyPwm();
     updateScreenValues();
@@ -253,6 +256,8 @@ void setup() {
   lastDutyA = digitalRead(ENC_DUTY_A);
   lastFreqA = digitalRead(ENC_FREQ_A);
 
+  // IMPORTANT: Attach PWM pin to LEDC channel ONCE
+  //ledcSetup(PWM_CH, (double)frequency, PWM_RES_BITS);
   applyPwm();
 
   tft.init();
@@ -265,8 +270,7 @@ void setup() {
 
   initTempSensor();
   updateTempOnScreen();
-  
-  // Prevent immediate shutdown on boot
+
   lastHeartbeatTime = millis();
 }
 
@@ -281,15 +285,12 @@ void loop() {
   // 2. KNOBS
   checkEncoders();
 
-  // 3. SAFETY WATCHDOG (NEW!)
-  // If connected AND >2 seconds since last heartbeat...
+  // 3. SAFETY WATCHDOG
   if (isConnected && (millis() - lastHeartbeatTime > 2000)) {
-    // EMERGENCY SHUTDOWN
     dutyCycle = 0;
-    applyPwm(); // Force Hardware to 0
-    isConnected = false; // Drop connection
-    
-    // RED SCREEN ALERT
+    applyPwm();
+    isConnected = false;
+
     tft.fillScreen(TFT_RED);
     tft.setTextColor(TFT_WHITE, TFT_RED);
     tft.setTextSize(3);
@@ -298,17 +299,16 @@ void loop() {
     tft.setTextSize(2);
     tft.setCursor(40, 150);
     tft.print("Safety Shutdown");
-    
-    delay(2000); // Hold for 2 seconds
-    
-    // Restore Normal Screen
+
+    delay(2000);
+
     tft.fillScreen(TFT_BLACK);
     drawInterface();
     drawStatusLight();
     updateScreenValues();
     updateTempOnScreen();
-    
-    lastHeartbeatTime = millis(); // Reset timer
+
+    lastHeartbeatTime = millis();
   }
 
   // 4. TEMP UPDATE (Every 500ms)
