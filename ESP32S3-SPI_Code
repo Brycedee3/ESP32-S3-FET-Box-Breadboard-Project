@@ -7,7 +7,7 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-// --- PINS ---
+// ---------------- PINS ----------------
 // DUTY ENCODER (Knob 1)
 #define ENC_DUTY_A 6
 #define ENC_DUTY_B 7
@@ -18,57 +18,98 @@ TFT_eSPI tft = TFT_eSPI();
 #define ENC_FREQ_B 16
 #define ENC_FREQ_SW 17
 
-// --- PWM OUTPUT PIN ---
+// PWM OUTPUT PIN
 #define PWM_OUT_PIN 8
 
-// --- DS18B20 DATA PIN ---
+// DS18B20 DATA PIN
 #define DS18B20_PIN 18
 
-// --- LEDC (ESP32 PWM) SETTINGS ---
-const int PWM_CH = 0;                        // PWM channel (0..15 typical)
-const int PWM_RES_BITS = 10;                 // 10-bit resolution (0..1023)
+// ---------------- PWM SETTINGS ----------------
+// NOTE: High frequency + high resolution can be impossible.
+// 10-bit is fine for low kHz; for tens of kHz you may need 8-bit.
+const int PWM_RES_BITS = 10;                 // 0..1023
 const int PWM_MAX = (1 << PWM_RES_BITS) - 1; // 1023
 
-// --- DS18B20 objects ---
+// ---------------- DS18B20 objects ----------------
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 
-// --- STATE VARIABLES ---
-int dutyCycle = 50;
-long frequency = 1000;
+// ---------------- STATE ----------------
+int dutyCycle = 50;        // percent
+long frequency = 1000;     // Hz
+
 bool extSource = false;
 bool altMode = false;
 bool isConnected = false;
 
-// --- WATCHDOG TIMER (NEW) ---
 unsigned long lastHeartbeatTime = 0;
 
 // Temperature state
 float tempC = NAN;
 bool tempOk = false;
 
-// --- ENCODER EDGE STATE ---
 int lastDutyA = HIGH;
 int lastFreqA = HIGH;
 
 unsigned long lastTempUpdate = 0;
 
-// ---------- PWM APPLY ----------
-void applyPwm() {
-  long f = constrain(frequency, 1, 100000);
-  int d  = constrain(dutyCycle, 0, 100);
+// Track what we actually applied
+long lastAppliedFreq = -1;
+int  lastAppliedDuty = -1;
 
-  // Attach PWM to the pin with desired frequency and resolution
-  ledcAttach(PWM_OUT_PIN, (uint32_t)f, PWM_RES_BITS);
-
-  // Convert percent to raw counts
-  uint32_t dutyCounts = (uint32_t)((d * PWM_MAX) / 100);
-
-  // Write duty directly to the PIN (not channel!)
-  ledcWrite(PWM_OUT_PIN, dutyCounts);
+// ---------------- PWM HELPERS ----------------
+static inline uint32_t dutyPercentToCounts(int dPercent) {
+  dPercent = constrain(dPercent, 0, 100);
+  return (uint32_t)((dPercent * PWM_MAX) / 100);
 }
 
-// ---------- UI DRAWING ----------
+void initPwm() {
+  // Attach once (Arduino-ESP32 core v3.x API)
+  bool ok = ledcAttach(PWM_OUT_PIN, (uint32_t)constrain(frequency, 1, 100000), PWM_RES_BITS);
+  Serial.print("ledcAttach(PWM_OUT_PIN) = ");
+  Serial.println(ok ? "OK" : "FAIL");
+
+  // Apply initial duty
+  ledcWrite(PWM_OUT_PIN, dutyPercentToCounts(dutyCycle));
+
+  lastAppliedFreq = frequency;
+  lastAppliedDuty = dutyCycle;
+
+  // Print the real frequency after attach (some boards quantize)
+  uint32_t actual = ledcChangeFrequency(PWM_OUT_PIN, (uint32_t)frequency, PWM_RES_BITS);
+  Serial.print("PWM init REQ=");
+  Serial.print(frequency);
+  Serial.print(" Hz  ACT=");
+  Serial.print(actual);
+  Serial.println(" Hz");
+}
+
+void applyPwm() {
+  long fReq = constrain(frequency, 1, 100000);
+  int  dReq = constrain(dutyCycle, 0, 100);
+
+  // Only change frequency if it changed
+  if (fReq != lastAppliedFreq) {
+    uint32_t actual = ledcChangeFrequency(PWM_OUT_PIN, (uint32_t)fReq, PWM_RES_BITS);
+
+    // If actual=0, change failed (usually means not attached)
+    Serial.print("PWM freq REQ=");
+    Serial.print(fReq);
+    Serial.print(" Hz  ACT=");
+    Serial.print(actual);
+    Serial.println(" Hz");
+
+    lastAppliedFreq = fReq;
+  }
+
+  // Only change duty if it changed
+  if (dReq != lastAppliedDuty) {
+    ledcWrite(PWM_OUT_PIN, dutyPercentToCounts(dReq));
+    lastAppliedDuty = dReq;
+  }
+}
+
+// ---------------- UI DRAWING ----------------
 void drawStatusLight() {
   int x = 300, y = 20, radius = 8;
   tft.fillRect(250, 10, 70, 20, TFT_BLUE);
@@ -130,7 +171,7 @@ void drawInterface() {
   tft.setCursor(10, 220);  tft.print("Temp:");
 }
 
-// ---------- TEMPERATURE ----------
+// ---------------- TEMPERATURE ----------------
 void initTempSensor() {
   sensors.begin();
   sensors.setWaitForConversion(false);
@@ -151,9 +192,9 @@ void pollTemperature() {
 
 void updateTempOnScreen() {
   tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
   tft.setCursor(80, 220);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.print("            ");
   tft.setCursor(80, 220);
 
@@ -162,12 +203,13 @@ void updateTempOnScreen() {
     tft.print("SENSOR ERR");
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
   } else {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.print(tempC, 2);
     tft.print(" C");
   }
 }
 
-// ---------- SERIAL PARSE ----------
+// ---------------- SERIAL PARSE ----------------
 void parseCommand(String cmd) {
   cmd.trim();
   int separator = cmd.indexOf(':');
@@ -206,9 +248,9 @@ void parseCommand(String cmd) {
   }
 }
 
-// ---------- ENCODERS ----------
+// ---------------- ENCODERS ----------------
 void checkEncoders() {
-  // --- DUTY KNOB ---
+  // DUTY knob
   int dutyA = digitalRead(ENC_DUTY_A);
   if (lastDutyA == HIGH && dutyA == LOW) {
     int dutyB = digitalRead(ENC_DUTY_B);
@@ -223,10 +265,12 @@ void checkEncoders() {
   }
   lastDutyA = dutyA;
 
-  // --- FREQ KNOB ---
+  // FREQ knob
   int freqA = digitalRead(ENC_FREQ_A);
   if (lastFreqA == HIGH && freqA == LOW) {
     int freqB = digitalRead(ENC_FREQ_B);
+
+    // Step size
     const long FREQ_STEP = 100;
 
     if (freqB == LOW) frequency -= FREQ_STEP;
@@ -241,7 +285,7 @@ void checkEncoders() {
   lastFreqA = freqA;
 }
 
-// ---------- SETUP ----------
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
 
@@ -256,10 +300,10 @@ void setup() {
   lastDutyA = digitalRead(ENC_DUTY_A);
   lastFreqA = digitalRead(ENC_FREQ_A);
 
-  // IMPORTANT: Attach PWM pin to LEDC channel ONCE
-  //ledcSetup(PWM_CH, (double)frequency, PWM_RES_BITS);
-  applyPwm();
+  // PWM must be attached before we can change frequency
+  initPwm();
 
+  // TFT
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
@@ -268,29 +312,33 @@ void setup() {
   drawStatusLight();
   updateScreenValues();
 
+  // Temp
   initTempSensor();
   updateTempOnScreen();
 
+  // Prevent immediate shutdown on boot
   lastHeartbeatTime = millis();
 }
 
-// ---------- LOOP ----------
+// ---------------- LOOP ----------------
 void loop() {
-  // 1. SERIAL INPUT
+  // 1) SERIAL INPUT
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     parseCommand(command);
   }
 
-  // 2. KNOBS
+  // 2) KNOBS
   checkEncoders();
 
-  // 3. SAFETY WATCHDOG
+  // 3) SAFETY WATCHDOG
   if (isConnected && (millis() - lastHeartbeatTime > 2000)) {
+    // Emergency shutdown
     dutyCycle = 0;
     applyPwm();
     isConnected = false;
 
+    // Red alert
     tft.fillScreen(TFT_RED);
     tft.setTextColor(TFT_WHITE, TFT_RED);
     tft.setTextSize(3);
@@ -302,6 +350,7 @@ void loop() {
 
     delay(2000);
 
+    // Restore UI
     tft.fillScreen(TFT_BLACK);
     drawInterface();
     drawStatusLight();
@@ -311,7 +360,7 @@ void loop() {
     lastHeartbeatTime = millis();
   }
 
-  // 4. TEMP UPDATE (Every 500ms)
+  // 4) TEMP UPDATE (every 500ms)
   if (millis() - lastTempUpdate > 500) {
     pollTemperature();
 
