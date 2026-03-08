@@ -1,0 +1,125 @@
+/*
+  ESP32-S3 BLE UART Example
+  - Connect from phone with a BLE app (ex: nRF Connect)
+  - Send text from phone to ESP32-S3
+  - ESP32-S3 sends notifications back
+
+  Board: ESP32-S3 Dev Module
+*/
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// Custom UART-style BLE service + characteristics
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_RX_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // phone -> ESP (WRITE)
+#define CHARACTERISTIC_TX_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // ESP -> phone (NOTIFY)
+
+BLECharacteristic *pTxCharacteristic;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+String rxString = "";
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) override {
+    deviceConnected = true;
+    Serial.println("BLE client connected");
+  }
+
+  void onDisconnect(BLEServer *pServer) override {
+    deviceConnected = false;
+    Serial.println("BLE client disconnected");
+  }
+};
+
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    String value = pCharacteristic->getValue();
+
+    if (value.length() > 0) {
+      Serial.print("Received over BLE: ");
+      Serial.println(value);
+
+      rxString = value;
+
+      // Optional: echo back to phone
+      String response = "ESP32-S3 got: " + value;
+      pTxCharacteristic->setValue(response.c_str());
+      pTxCharacteristic->notify();
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting BLE on ESP32-S3...");
+
+  // Create BLE device
+  BLEDevice::init("Bryce_ESP32S3");
+
+  // Create BLE server
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create BLE service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // TX characteristic (ESP -> phone)
+  pTxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_TX_UUID,
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  // RX characteristic (phone -> ESP)
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+                                           CHARACTERISTIC_RX_UUID,
+                                           BLECharacteristic::PROPERTY_WRITE
+                                         );
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  // Start service
+  pService->start();
+
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE advertising started");
+  Serial.println("Device name: Bryce_ESP32S3");
+}
+
+void loop() {
+  // If connected, send a message every 2 seconds
+  if (deviceConnected) {
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend > 2000) {
+      lastSend = millis();
+
+      String msg = "Hello from ESP32-S3, millis = " + String(millis());
+      pTxCharacteristic->setValue(msg.c_str());
+      pTxCharacteristic->notify();
+
+      Serial.println("Sent: " + msg);
+    }
+  }
+
+  // Handle disconnect/reconnect cleanly
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500);
+    BLEDevice::startAdvertising();
+    Serial.println("Restarted advertising");
+    oldDeviceConnected = deviceConnected;
+  }
+
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+}
