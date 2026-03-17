@@ -5,48 +5,33 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-// ===================== PINS =====================
+// ---------------- PINS ----------------
 // DUTY ENCODER (Knob 1)
-#define ENC_DUTY_A   6
-#define ENC_DUTY_B   7
-#define ENC_DUTY_SW  4
+#define ENC_DUTY_A 6
+#define ENC_DUTY_B 7
+#define ENC_DUTY_SW 4
 
 // FREQ ENCODER (Knob 2)
-#define ENC_FREQ_A   15
-#define ENC_FREQ_B   16
-#define ENC_FREQ_SW  17
+#define ENC_FREQ_A 15
+#define ENC_FREQ_B 16
+#define ENC_FREQ_SW 17
 
-// PWM OUTPUT PIN (ESP32-S3: pick a "normal" GPIO; avoid USB pins, boot strapping pins)
-#define PWM_OUT_PIN  8
+// PWM OUTPUT PIN
+#define PWM_OUT_PIN 8
 
 // DS18B20 DATA PIN
-#define DS18B20_PIN  18
+#define DS18B20_PIN 18
 
-// ===================== LIMITS =====================
-const long FREQ_MIN = 1;
-const long FREQ_MAX = 350000;      // target max = 350 kHz
-
-// High-frequency band start: from here up, we force a stable configuration.
-const long HIGH_BAND_START = 200000;
-
-// High-band snap step: reduces “frequency flipping” due to LEDC quantization
-const long HIGH_SNAP_STEP = 5000;  // 5 kHz steps (stable)
-
-// “Settle time” so we don't spam retunes while you're spinning the knob
-const unsigned long FREQ_SETTLE_MS = 25;
-
-// ===================== TEMP SENSOR =====================
+// ---------------- DS18B20 ----------------
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 
-// ===================== UI/STATE =====================
-int  dutyCycle = 50;          // percent (user intent)
-long freqUser  = 1000;        // user intent (Hz)
-long freqShown = 1000;        // what we display (locked to actual)
-uint32_t freqAct = 0;         // actual LEDC frequency (Hz)
+// ---------------- STATE ----------------
+int  dutyCycle = 50;         // %
+long frequency = 1000;       // Hz (requested)
 
-bool extSource   = false;
-bool altMode     = false;
+bool extSource = false;
+bool altMode   = false;
 bool isConnected = false;
 
 unsigned long lastHeartbeatTime = 0;
@@ -59,129 +44,104 @@ int lastFreqA = HIGH;
 
 unsigned long lastTempUpdate = 0;
 
-// ===================== PWM INTERNAL =====================
-int currentResBits = 10;
-int lastAppliedResBits = -1;
-int lastAppliedDuty = -1;
+// Track what we applied
+long lastAppliedFreq = -1;
+int  lastAppliedDuty = -1;
+int  lastAppliedRes  = -1;
 
-long pendingFreq = 1000;
-bool freqDirty = true;
-unsigned long lastFreqEditMs = 0;
+// What hardware actually set
+uint32_t actualFreq = 0;
 
-// ---- Helper: counts, snapping, etc. ----
-static inline uint32_t maxCounts(int bits) {
-  if (bits <= 0) return 1;
-  if (bits >= 31) return 0x7FFFFFFF;
-  return (1u << bits) - 1u;
+// ---------------- PWM CONFIG (AUTO RES) ----------------
+// You want up to 500 kHz:
+const long FREQ_MIN = 1;
+const long FREQ_MAX = 500000;
+
+// Frequency step from encoder (you can tune)
+long freqStep = 100; // will auto-scale based on current frequency
+
+// Pick resolution based on target frequency.
+// Higher frequency => fewer bits.
+int pickResolutionBits(long f) {
+  if (f <= 20000)   return 10; 
+  if (f <= 80000)   return 8;  
+  if (f <= 200000)  return 4; // Lowered from 250k to 200k for stability
+  if (f <= 400000)  return 2; // Added a 2nd-bit stage (0, 25, 50, 75, 100%)
+  return 1;                   // Force 1-bit for 400kHz to 500kHz
 }
 
-static inline uint32_t dutyPercentToCounts(int percent, int bits) {
-  percent = constrain(percent, 0, 100);
-  uint32_t m = maxCounts(bits);
-  return (uint32_t)((uint64_t)percent * (uint64_t)m / 100ull);
+uint32_t maxCountsForRes(int resBits) {
+  if (resBits <= 0) return 1;
+  if (resBits >= 31) return 0x7FFFFFFF;
+  return (1u << resBits) - 1u;
 }
 
-// In high band, we *must* reduce resolution to make 200–350k stable.
-// This mapping is conservative for ESP32-S3.
-int chooseResBits(long f) {
-  if (f >= HIGH_BAND_START) return 1;     // 1-bit (0/50/100% duty) = most stable
-  if (f >= 120000)          return 4;
-  if (f >= 30000)           return 8;
-  return 10;
+uint32_t dutyPercentToCounts(int dPercent, int resBits) {
+  dPercent = constrain(dPercent, 0, 100);
+  uint32_t maxc = maxCountsForRes(resBits);
+  return (uint32_t)((uint64_t)dPercent * (uint64_t)maxc / 100ull);
 }
 
-// Snap frequency to realizable increments to prevent “flip-flop”
-long snapFreq(long f) {
-  f = constrain(f, FREQ_MIN, FREQ_MAX);
+void initPwm() {
+  // Attach once with a reasonable starting resolution for initial frequency
+  int res = pickResolutionBits(frequency);
+  bool ok = ledcAttach(PWM_OUT_PIN, (uint32_t)constrain(frequency, FREQ_MIN, FREQ_MAX), res);
 
-  if (f < 20000)           return f;                  // 1 Hz
-  if (f < 100000)          return (f / 100) * 100;    // 100 Hz
-  if (f < HIGH_BAND_START) return (f / 1000) * 1000;  // 1 kHz
-  return (f / HIGH_SNAP_STEP) * HIGH_SNAP_STEP;       // 5 kHz in high band
+  Serial.print("ledcAttach = ");
+  Serial.println(ok ? "OK" : "FAIL");
+
+  lastAppliedFreq = -1;
+  lastAppliedDuty = -1;
+  lastAppliedRes  = -1;
+
+  // Apply immediately
+  // (This will call ledcChangeFrequency + ledcWrite)
+  // so we get REQ/ACT prints.
 }
 
-// In 1-bit, duty only effectively supports 0/50/100 (anything else jitters/rounds)
-int snapDuty1Bit(int d) {
-  d = constrain(d, 0, 100);
-  if (d < 25) return 0;
-  if (d < 75) return 50;
-  return 100;
-}
+void applyPwm() {
+  long fReq = constrain(frequency, FREQ_MIN, FREQ_MAX);
+  int  dReq = constrain(dutyCycle, 0, 100);
 
-// Attach (or re-attach) PWM with chosen resolution
-void pwmAttachIfNeeded(long f) {
-  int wantRes = chooseResBits(f);
+  int resReq = pickResolutionBits(fReq);
 
-  if (wantRes != currentResBits || lastAppliedResBits < 0) {
-    currentResBits = wantRes;
-
-    bool ok = ledcAttach(PWM_OUT_PIN, (uint32_t)f, currentResBits);
-    Serial.print("PWM attach PIN=");
-    Serial.print(PWM_OUT_PIN);
-    Serial.print(" RES=");
-    Serial.print(currentResBits);
+  // If resolution changes, re-attach with new resolution
+  if (resReq != lastAppliedRes) {
+    // Re-attach at new resolution & current freq
+    bool ok = ledcAttach(PWM_OUT_PIN, (uint32_t)fReq, resReq);
+    Serial.print("PWM reattach res=");
+    Serial.print(resReq);
     Serial.print(" -> ");
     Serial.println(ok ? "OK" : "FAIL");
 
-    lastAppliedResBits = currentResBits;
-    lastAppliedDuty = -1; // force duty rewrite after attach
+    lastAppliedRes = resReq;
+    lastAppliedFreq = -1; // force freq update after reattach
+    lastAppliedDuty = -1; // force duty rewrite after reattach
+  }
+
+  // Frequency update
+  if (fReq != lastAppliedFreq) {
+    actualFreq = ledcChangeFrequency(PWM_OUT_PIN, (uint32_t)fReq, lastAppliedRes);
+
+    Serial.print("PWM FREQ  REQ=");
+    Serial.print(fReq);
+    Serial.print(" Hz  ACT=");
+    Serial.print(actualFreq);
+    Serial.print(" Hz  RES=");
+    Serial.println(lastAppliedRes);
+
+    lastAppliedFreq = fReq;
+  }
+
+  // Duty update (note: at 1-bit resolution, duty options are extremely limited)
+  if (dReq != lastAppliedDuty) {
+    uint32_t dutyCounts = dutyPercentToCounts(dReq, lastAppliedRes);
+    ledcWrite(PWM_OUT_PIN, dutyCounts);
+    lastAppliedDuty = dReq;
   }
 }
 
-// Apply duty using current resolution
-void pwmApplyDuty() {
-  int d = dutyCycle;
-
-  if (currentResBits == 1) {
-    d = snapDuty1Bit(d);
-    dutyCycle = d; // reflect reality on UI
-  }
-
-  if (d != lastAppliedDuty) {
-    ledcWrite(PWM_OUT_PIN, dutyPercentToCounts(d, currentResBits));
-    lastAppliedDuty = d;
-  }
-}
-
-// Apply frequency (once) and lock UI to ACT result
-void pwmApplyFrequencyNow(long f) {
-  f = snapFreq(f);
-
-  pwmAttachIfNeeded(f);
-
-  uint32_t act = ledcChangeFrequency(PWM_OUT_PIN, (uint32_t)f, currentResBits);
-
-  if (act != 0) {
-    freqAct = act;
-
-    // Lock everything to actual so it doesn't “fight” LEDC quantization
-    freqUser  = (long)freqAct;
-    pendingFreq = (long)freqAct;
-    freqShown = (long)freqAct;
-
-    Serial.print("PWM FREQ REQ=");
-    Serial.print(f);
-    Serial.print(" ACT=");
-    Serial.print(freqAct);
-    Serial.print(" RES=");
-    Serial.println(currentResBits);
-  } else {
-    Serial.println("PWM freq change failed (ACT=0)");
-  }
-
-  pwmApplyDuty();
-}
-
-void pwmInit() {
-  pendingFreq = snapFreq(freqUser);
-  pwmAttachIfNeeded(pendingFreq);
-
-  // Set initial duty and frequency
-  pwmApplyDuty();
-  pwmApplyFrequencyNow(pendingFreq);
-}
-
-// ===================== UI =====================
+// ---------------- UI ----------------
 void drawStatusLight() {
   int x = 300, y = 20, radius = 8;
   tft.fillRect(250, 10, 70, 20, TFT_BLUE);
@@ -226,9 +186,11 @@ void updateScreenValues() {
   tft.setCursor(80, 60);  tft.print("        ");
   tft.setCursor(80, 60);  tft.print(dutyCycle); tft.print(" %");
 
-  // Frequency (ACT-locked)
-  tft.setCursor(80, 100); tft.print("              ");
-  tft.setCursor(80, 100); tft.print(freqShown); tft.print(" Hz");
+  // Freq (show requested)
+  tft.setCursor(80, 100); tft.print("            ");
+  tft.setCursor(80, 100); tft.print(frequency); tft.print(" Hz");
+
+  // Optional: show actual + res in Serial (already), but keep screen simple
 
   // Source
   tft.setCursor(80, 140); tft.print("        ");
@@ -236,14 +198,14 @@ void updateScreenValues() {
   if (extSource) tft.print("EXTERNAL");
   else           tft.print("INTERNAL");
 
-  // FET2
+  // FET2 mode
   tft.setCursor(80, 180); tft.print("          ");
   tft.setCursor(80, 180);
   if (altMode) tft.print("ALTERNATE");
   else         tft.print("COPY (q)");
 }
 
-// ===================== TEMP =====================
+// ---------------- TEMP ----------------
 void initTempSensor() {
   sensors.begin();
   sensors.setWaitForConversion(false);
@@ -252,15 +214,19 @@ void initTempSensor() {
 
 void pollTemperature() {
   float t = sensors.getTempCByIndex(0);
-  if (t == DEVICE_DISCONNECTED_C) tempOk = false;
-  else { tempOk = true; tempC = t; }
+  if (t == DEVICE_DISCONNECTED_C) {
+    tempOk = false;
+  } else {
+    tempOk = true;
+    tempC = t;
+  }
   sensors.requestTemperatures();
 }
 
 void updateTempOnScreen() {
   tft.setTextSize(2);
-  tft.setCursor(80, 220);
 
+  tft.setCursor(80, 220);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.print("            ");
   tft.setCursor(80, 220);
@@ -270,37 +236,32 @@ void updateTempOnScreen() {
     tft.print("SENSOR ERR");
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
   } else {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.print(tempC, 2);
     tft.print(" C");
   }
 }
 
-// ===================== SERIAL =====================
+// ---------------- SERIAL PARSE ----------------
 void parseCommand(String cmd) {
   cmd.trim();
-  int sep = cmd.indexOf(':');
-  if (sep == -1) return;
+  int separator = cmd.indexOf(':');
+  if (separator == -1) return;
 
-  String type = cmd.substring(0, sep);
-  String val  = cmd.substring(sep + 1);
+  String type = cmd.substring(0, separator);
+  String val  = cmd.substring(separator + 1);
 
   if (type == "DUTY") {
     dutyCycle = constrain(val.toInt(), 0, 100);
-    pwmApplyDuty();
+    applyPwm();
     updateScreenValues();
     Serial.print("DUTY:"); Serial.println(dutyCycle);
   }
   else if (type == "FREQ") {
-    freqUser = constrain((long)val.toInt(), FREQ_MIN, FREQ_MAX);
-    pendingFreq = snapFreq(freqUser);
-    freqDirty = true;
-    lastFreqEditMs = millis();
-
-    // show pending immediately
-    freqShown = pendingFreq;
+    frequency = constrain((long)val.toInt(), FREQ_MIN, FREQ_MAX);
+    applyPwm();
     updateScreenValues();
-
-    Serial.print("FREQ_REQ:"); Serial.println(pendingFreq);
+    Serial.print("FREQ:"); Serial.println(frequency);
   }
   else if (type == "SOURCE") {
     extSource = (val == "EXT");
@@ -320,50 +281,52 @@ void parseCommand(String cmd) {
   }
 }
 
-// ===================== ENCODERS =====================
-long freqStepFor(long f) {
-  f = constrain(f, FREQ_MIN, FREQ_MAX);
-  if      (f < 20000)           return 100;
-  else if (f < 100000)          return 1000;
-  else if (f < HIGH_BAND_START) return 2000;
-  else                          return HIGH_SNAP_STEP; // 5 kHz steps in high band
+// ---------------- ENCODERS ----------------
+void updateFreqStep() {
+  // Auto step scaling so you can actually reach 500k quickly
+  long f = constrain(frequency, FREQ_MIN, FREQ_MAX);
+  if      (f < 10000)   freqStep = 100;
+  else if (f < 100000)  freqStep = 1000;
+  else if (f < 300000)  freqStep = 5000;
+  else                  freqStep = 10000;
 }
 
 void checkEncoders() {
-  // DUTY
+  // DUTY knob
   int dutyA = digitalRead(ENC_DUTY_A);
   if (lastDutyA == HIGH && dutyA == LOW) {
     int dutyB = digitalRead(ENC_DUTY_B);
-    dutyCycle += (dutyB == LOW) ? -1 : +1;
-    dutyCycle = constrain(dutyCycle, 0, 100);
+    if (dutyB == LOW) dutyCycle--;
+    else              dutyCycle++;
 
-    pwmApplyDuty();
+    dutyCycle = constrain(dutyCycle, 0, 100);
+    applyPwm();
     updateScreenValues();
     Serial.print("DUTY:"); Serial.println(dutyCycle);
+    delay(1);
   }
   lastDutyA = dutyA;
 
-  // FREQ
+  // FREQ knob
   int freqA = digitalRead(ENC_FREQ_A);
   if (lastFreqA == HIGH && freqA == LOW) {
     int freqB = digitalRead(ENC_FREQ_B);
-    long step = freqStepFor(pendingFreq);
 
-    pendingFreq += (freqB == LOW) ? -step : +step;
-    pendingFreq = constrain(pendingFreq, FREQ_MIN, FREQ_MAX);
-    pendingFreq = snapFreq(pendingFreq);
+    updateFreqStep();
 
-    freqDirty = true;
-    lastFreqEditMs = millis();
+    if (freqB == LOW) frequency -= freqStep;
+    else              frequency += freqStep;
 
-    // show pending while turning
-    freqShown = pendingFreq;
+    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
+    applyPwm();
     updateScreenValues();
+    Serial.print("FREQ:"); Serial.println(frequency);
+    delay(1);
   }
   lastFreqA = freqA;
 }
 
-// ===================== SETUP =====================
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
 
@@ -379,7 +342,8 @@ void setup() {
   lastFreqA = digitalRead(ENC_FREQ_A);
 
   // PWM
-  pwmInit();
+  initPwm();
+  applyPwm();
 
   // TFT
   tft.init();
@@ -389,35 +353,28 @@ void setup() {
   drawStatusLight();
   updateScreenValues();
 
-  // TEMP
+  // Temp
   initTempSensor();
   updateTempOnScreen();
 
   lastHeartbeatTime = millis();
 }
 
-// ===================== LOOP =====================
+// ---------------- LOOP ----------------
 void loop() {
-  // Serial
+  // 1) SERIAL INPUT
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     parseCommand(command);
   }
 
-  // Encoders
+  // 2) KNOBS
   checkEncoders();
 
-  // Apply frequency after settle time
-  if (freqDirty && (millis() - lastFreqEditMs >= FREQ_SETTLE_MS)) {
-    freqDirty = false;
-    pwmApplyFrequencyNow(pendingFreq);
-    updateScreenValues();
-  }
-
-  // Safety watchdog
+  // 3) SAFETY WATCHDOG
   if (isConnected && (millis() - lastHeartbeatTime > 2000)) {
     dutyCycle = 0;
-    pwmApplyDuty();
+    applyPwm();
     isConnected = false;
 
     tft.fillScreen(TFT_RED);
@@ -440,7 +397,7 @@ void loop() {
     lastHeartbeatTime = millis();
   }
 
-  // Temp update
+  // 4) TEMP UPDATE (every 500ms)
   if (millis() - lastTempUpdate > 500) {
     pollTemperature();
 
