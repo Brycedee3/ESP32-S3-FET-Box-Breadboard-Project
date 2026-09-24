@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FET Box Wireless Controller</title>
+    <style>
+        :root {
+            --bg-color: #f4f4f9;
+            --panel-bg: #ffffff;
+            --text-color: #333333;
+            --tamu-maroon: #500000;
+            --tamu-maroon-hover: #700000;
+            --input-bg: #eeeeee;
+            --input-border: #cccccc;
+            --divider: #dddddd;
+            --shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+
+        [data-theme="dark"] {
+            --bg-color: #1a1a1a;
+            --panel-bg: #2b2b2b;
+            --text-color: #dce4ee;
+            --tamu-maroon: #b03030; 
+            --tamu-maroon-hover: #d04040;
+            --input-bg: #343638;
+            --input-border: #3b3b3b;
+            --divider: #555;
+            --shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background-color: var(--bg-color); 
+            color: var(--text-color); 
+            margin: 0; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh;
+            overflow: hidden;
+            transition: background-color 0.3s, color 0.3s;
+        }
+
+        /* --- LOGIN OVERLAY --- */
+        #loginOverlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background-color: var(--bg-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .login-box {
+            width: 400px;
+            background-color: var(--panel-bg);
+            padding: 40px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: var(--shadow);
+            border-top: 8px solid var(--tamu-maroon);
+        }
+        .login-box h2 { color: var(--tamu-maroon); margin-bottom: 5px; font-weight: 900; font-size: 28px; letter-spacing: 1px; }
+        .login-box p { color: #888; font-size: 14px; margin-bottom: 25px; font-weight: bold; }
+        .login-box input { 
+            width: 85%; padding: 12px; margin-bottom: 15px; 
+            border-radius: 6px; border: 2px solid var(--input-border); 
+            background-color: var(--input-bg); color: var(--text-color);
+            font-size: 14px;
+        }
+        .btn-auth { background-color: var(--tamu-maroon); color: white; width: 92%; padding: 14px; font-weight: bold; font-size: 16px; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; }
+        .btn-auth:hover { background-color: var(--tamu-maroon-hover); }
+        #loginError { color: #FF5555; font-size: 13px; margin-top: 15px; min-height: 15px; font-weight: bold; }
+
+        /* --- MAIN GUI --- */
+        #mainGui {
+            display: none; 
+            width: 900px;
+            height: 600px;
+            justify-content: space-between;
+            padding: 20px;
+            position: relative;
+        }
+        .panel {
+            width: 400px; background-color: var(--panel-bg); 
+            border-radius: 8px; padding: 25px;
+            display: flex; flex-direction: column; align-items: center;
+            box-shadow: var(--shadow);
+            border-top: 5px solid var(--tamu-maroon);
+            box-sizing: border-box;
+        }
+        .section-title { font-size: 22px; font-weight: 900; color: var(--tamu-maroon); margin-bottom: 25px; letter-spacing: 1.5px; }
+        .control-label { font-size: 14px; font-weight: bold; margin: 10px 0 8px 0; align-self: flex-start; width: 100%; color: var(--text-color); }
+        
+        .input-row { display: flex; width: 100%; gap: 10px; margin-bottom: 15px; }
+        .input-row input { flex: 2; padding: 12px; border-radius: 6px; border: 2px solid var(--input-border); background-color: var(--input-bg); color: var(--text-color); font-size: 16px; }
+        .input-row select { flex: 1; padding: 12px; border-radius: 6px; border: 2px solid var(--input-border); background-color: var(--input-bg); color: var(--text-color); font-weight: bold; }
+        .input-row button { flex: 1; padding: 12px; background-color: var(--tamu-maroon); border: none; border-radius: 6px; color: white; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        .input-row button:hover { background-color: var(--tamu-maroon-hover); }
+
+        .divider { color: var(--divider); margin: 10px 0; letter-spacing: 3px; font-size: 12px; }
+        
+        .toggle-group { display: flex; width: 100%; margin-bottom: 15px; }
+        .toggle-btn { flex: 1; padding: 12px; cursor: pointer; background-color: var(--input-bg); color: var(--text-color); border: 2px solid var(--input-border); transition: 0.2s; font-weight: bold; }
+        .toggle-btn:first-child { border-radius: 6px 0 0 6px; }
+        .toggle-btn:not(:first-child):not(:last-child) { border-left: none; border-right: none; }
+        .toggle-btn:last-child { border-radius: 0 6px 6px 0; }
+        .toggle-btn.active { background-color: var(--tamu-maroon); color: white; border-color: var(--tamu-maroon); }
+        
+        .monitor-title { font-size: 14px; margin-bottom: 5px; color: var(--text-color); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
+        .monitor-data { font-size: 38px; font-weight: bold; color: var(--tamu-maroon); margin-bottom: 25px; font-family: monospace; }
+        .monitor-data.alert { color: #FF5555; }
+        
+        .connection-area { display: flex; align-items: center; justify-content: space-between; margin-top: auto; width: 100%; background-color: var(--input-bg); padding: 15px; border-radius: 8px; box-sizing: border-box; }
+        .status-light { width: 18px; height: 18px; border-radius: 50%; background-color: red; margin-right: 15px; box-shadow: 0 0 8px rgba(0,0,0,0.5); }
+        .btn-connect { background-color: #2fa572; color: white; padding: 12px 20px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; width: 100%; text-align: center; transition: 0.2s; font-size: 16px; } 
+        .btn-disconnect { background-color: #8b0000; color: white; padding: 12px 20px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; width: 100%; text-align: center; transition: 0.2s; font-size: 16px; }
+
+        .top-bar { position: absolute; top: -30px; right: 0; display: flex; gap: 15px; align-items: center; }
+        .theme-toggle { cursor: pointer; font-size: 14px; background: var(--panel-bg); padding: 8px 15px; border-radius: 20px; border: 2px solid var(--input-border); color: var(--text-color); font-weight: bold; }
+        .branding { position: absolute; bottom: -25px; right: 0; font-size: 12px; font-style: italic; color: #888; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="loginOverlay">
+        <div class="login-box">
+            <h2>TEXAS A&M</h2>
+            <p>FET Box Equipment Access</p>
+            <input type="text" id="emailInput" placeholder="Email (@tamu.edu)">
+            <input type="password" id="uinInput" placeholder="9-Digit UIN">
+            <button class="btn-auth" id="loginBtn">AUTHENTICATE</button>
+            <div id="loginError"></div>
+        </div>
+    </div>
+
+    <div id="mainGui" class="main-window">
+        <div class="top-bar">
+            <button class="theme-toggle" id="themeToggleBtn">Dark Mode</button>
+        </div>
+
+        <div class="panel">
+            <div class="section-title">CONTROLS</div>
+            
+            <div class="control-label">Set Duty Cycle (%)</div>
+            <div class="input-row">
+                <input type="number" id="dutyInput" placeholder="e.g., 50" min="0" max="100">
+                <button id="sendDutyBtn">SEND</button>
+            </div>
+            
+            <div class="divider">-------------------------</div>
+            
+            <div class="control-label">Set Frequency</div>
+            <div class="input-row">
+                <input type="number" id="freqInput" placeholder="e.g., 10">
+                <select id="freqUnit">
+                    <option value="1">Hz</option>
+                    <option value="1000">kHz</option>
+                    <option value="100000">100kHz</option>
+                </select>
+                <button id="sendFreqBtn">SEND</button>
+            </div>
+            
+            <div class="divider">-------------------------</div>
+            
+            <div class="control-label">Signal Source q(t)</div>
+            <div class="toggle-group">
+                <button id="btnSrcInt" class="toggle-btn active">Internal</button>
+                <button id="btnSrcExt" class="toggle-btn">External</button>
+            </div>
+            
+            <div class="control-label">FET 2 Mode Topology</div>
+            <div class="toggle-group">
+                <button id="btnFetCopy" class="toggle-btn active">Copy (q)</button>
+                <button id="btnFetAlt" class="toggle-btn">Alternate</button>
+                <button id="btnFetAltQ" class="toggle-btn">Alt Pulses</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="section-title">LIVE MONITOR</div>
+            
+            <div class="monitor-title">Current Duty</div>
+            <div class="monitor-data" id="liveDuty">-- %</div>
+            
+            <div class="monitor-title">Current Freq</div>
+            <div class="monitor-data" id="liveFreq">-- Hz</div>
+            
+            <div class="monitor-title">Hardware Temperature</div>
+            <div class="monitor-data alert" id="liveTemp">-- °C</div>
+            
+            <div class="connection-area">
+                <div style="display:flex; align-items:center; width: 40%;">
+                    <div class="status-light" id="statusLight"></div>
+                    <span style="font-weight:bold; font-size: 14px;" id="connText">NO LINK</span>
+                </div>
+                <div style="width: 60%;">
+                    <button id="connectBtn" class="btn-connect">CONNECT</button>
+                </div>
+            </div>
+        </div>
+        <div class="branding">Engineered by the Balog Bros</div>
+    </div>
+
+    <script>
+        // --- THEME MANAGEMENT ---
+        const themeBtn = document.getElementById('themeToggleBtn');
+        const savedTheme = localStorage.getItem('fetBoxTheme') || 'light';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+        themeBtn.innerText = savedTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
+
+        themeBtn.addEventListener('click', () => {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', newTheme);
+            localStorage.setItem('fetBoxTheme', newTheme);
+            themeBtn.innerText = newTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
+        });
+
+        // --- BLUETOOTH CONFIG ---
+        const bleServiceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+        const bleRxUUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; 
+        const bleTxUUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; 
+
+        let bluetoothDevice;
+        let rxCharacteristic;
+        let txCharacteristic;
+        let heartbeatInterval;
+        let currentFetMode = "COPY";
+
+        // --- SUPABASE CONFIG ---
+        const SUPABASE_URL = "https://lnmlgvlkhwyizubtlskp.supabase.co/";
+        const SUPABASE_KEY = "sb_publishable_lTDc603U2Wajny-Wh4Zifw_nstCyyf1";
+
+        // ==========================================
+        // 1. SUPABASE AUTH & LOGGING
+        // ==========================================
+        const loginBtn = document.getElementById('loginBtn');
+        const emailInput = document.getElementById('emailInput');
+        const uinInput = document.getElementById('uinInput');
+        const errorLabel = document.getElementById('loginError');
+
+        // Enter key for Login
+        emailInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') uinInput.focus(); });
+        uinInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') loginBtn.click(); });
+
+        loginBtn.addEventListener('click', async () => {
+            const email = emailInput.value.trim().toLowerCase();
+            const uin = uinInput.value.trim();
+
+            if (!email.endsWith("@tamu.edu")) {
+                errorLabel.innerText = "Access Denied: Must use a @tamu.edu email.";
+                return;
+            }
+            if (uin.length !== 9 || isNaN(uin)) {
+                errorLabel.innerText = "Access Denied: Invalid 9-digit UIN.";
+                return;
+            }
+
+            errorLabel.style.color = "var(--text-color)";
+            errorLabel.innerText = "Verifying roster...";
+
+            try {
+                // 1. Check if the user exists in the 'roster' table and fetch their UIN
+                let rosterResponse = await fetch(`${SUPABASE_URL}rest/v1/roster?email=eq.${encodeURIComponent(email)}&select=UIN`, {
+                    method: 'GET',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_KEY}`
+                    }
+                });
+
+                if (!rosterResponse.ok) throw new Error("Failed to fetch roster");
+                
+                let rosterData = await rosterResponse.json();
+
+                // 2. Validate the email and UIN against the roster data
+                if (rosterData.length === 0) {
+                    errorLabel.style.color = "#FF5555";
+                    errorLabel.innerText = "Access Denied: Email not found in roster.";
+                    return;
+                }
+                
+                if (String(rosterData[0].UIN) !== uin) {
+                    errorLabel.style.color = "#FF5555";
+                    errorLabel.innerText = "Access Denied: UIN does not match roster records.";
+                    return;
+                }
+
+                // 3. If validation passes, log the session to 'user_sessions'
+                await fetch(`${SUPABASE_URL}rest/v1/user_sessions`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_KEY}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        email: email, 
+                        UIN: parseInt(uin),
+                        app_type: "Web GUI"
+                    })
+                });
+
+                // Transition UI
+                document.getElementById('loginOverlay').style.display = 'none';
+                document.getElementById('mainGui').style.display = 'flex';
+
+            } catch (err) { 
+                console.error("Database log failed", err); 
+                errorLabel.style.color = "#FF5555";
+                errorLabel.innerText = "Network Error: Could not reach Supabase.";
+            }
+        });
+
+        // ==========================================
+        // 2. HARDWARE & BLE LOGIC
+        // ==========================================
+        document.getElementById('connectBtn').addEventListener('click', async () => {
+            if (bluetoothDevice && bluetoothDevice.gatt.connected) {
+                bluetoothDevice.gatt.disconnect();
+                return;
+            }
+            try {
+                document.getElementById('connectBtn').innerText = "CONNECTING...";
+                bluetoothDevice = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'FET_Box_BLE' }],
+                    optionalServices: [bleServiceUUID]
+                });
+                const server = await bluetoothDevice.gatt.connect();
+                const service = await server.getPrimaryService(bleServiceUUID);
+                rxCharacteristic = await service.getCharacteristic(bleRxUUID);
+                txCharacteristic = await service.getCharacteristic(bleTxUUID);
+                
+                await txCharacteristic.startNotifications();
+                txCharacteristic.addEventListener('characteristicvaluechanged', handleIncomingData);
+                
+                document.getElementById('statusLight').style.backgroundColor = "#00FF00"; 
+                document.getElementById('statusLight').style.boxShadow = "0 0 10px #00FF00";
+                document.getElementById('connText').innerText = "LINK OK";
+                document.getElementById('connectBtn').innerText = "DISCONNECT";
+                document.getElementById('connectBtn').className = "btn-disconnect";
+
+                sendCommand("CONN:ON");
+                heartbeatInterval = setInterval(() => sendCommand("HEARTBEAT:1", true), 1000);
+            } catch (error) { onDisconnected(); }
+        });
+
+        function onDisconnected() {
+            clearInterval(heartbeatInterval);
+            document.getElementById('statusLight').style.backgroundColor = "red";
+            document.getElementById('statusLight').style.boxShadow = "0 0 8px rgba(0,0,0,0.5)";
+            document.getElementById('connText').innerText = "NO LINK";
+            document.getElementById('connectBtn').innerText = "CONNECT";
+            document.getElementById('connectBtn').className = "btn-connect";
+            rxCharacteristic = null;
+        }
+
+        async function sendCommand(commandString, silent = false) {
+            if (!rxCharacteristic) return;
+            try {
+                let encoder = new TextEncoder('utf-8');
+                let data = encoder.encode(commandString + '\n');
+                await rxCharacteristic.writeValue(data);
+            } catch (error) { console.error(error); }
+        }
+
+        // --- COMMAND CLAMPING & MULTIPLIERS ---
+        const sendDutyBtn = document.getElementById('sendDutyBtn');
+        const dutyInput = document.getElementById('dutyInput');
+        const sendFreqBtn = document.getElementById('sendFreqBtn');
+        const freqInput = document.getElementById('freqInput');
+
+        // Enter key for Duty and Freq
+        dutyInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendDutyBtn.click(); });
+        freqInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendFreqBtn.click(); });
+
+        sendDutyBtn.addEventListener('click', () => {
+            let val = parseInt(dutyInput.value);
+            if (!isNaN(val)) {
+                if (currentFetMode === "ALTQ" && val > 50) {
+                    val = 50;
+                    dutyInput.value = 50;
+                }
+                sendCommand("DUTY:" + val);
+            }
+        });
+
+        sendFreqBtn.addEventListener('click', () => {
+            let baseVal = parseFloat(freqInput.value);
+            let multiplier = parseInt(document.getElementById('freqUnit').value);
+            
+            if (!isNaN(baseVal)) {
+                let finalFreq = Math.round(baseVal * multiplier);
+                sendCommand("FREQ:" + finalFreq);
+            }
+        });
+
+        // --- TOGGLE EVENT LISTENERS ---
+        const btnSrcInt = document.getElementById('btnSrcInt');
+        const btnSrcExt = document.getElementById('btnSrcExt');
+        
+        btnSrcInt.addEventListener('click', () => {
+            btnSrcInt.classList.add('active'); btnSrcExt.classList.remove('active');
+            sendCommand("SOURCE:INT");
+        });
+        btnSrcExt.addEventListener('click', () => {
+            btnSrcExt.classList.add('active'); btnSrcInt.classList.remove('active');
+            sendCommand("SOURCE:EXT");
+        });
+
+        const btnFetCopy = document.getElementById('btnFetCopy');
+        const btnFetAlt = document.getElementById('btnFetAlt');
+        const btnFetAltQ = document.getElementById('btnFetAltQ');
+
+        function updateFetMode(mode) {
+            currentFetMode = mode;
+            btnFetCopy.classList.remove('active');
+            btnFetAlt.classList.remove('active');
+            btnFetAltQ.classList.remove('active');
+
+            if (mode === 'COPY') {
+                btnFetCopy.classList.add('active');
+                sendCommand("FET2:COPY");
+            } else if (mode === 'ALT') {
+                btnFetAlt.classList.add('active');
+                sendCommand("FET2:ALT");
+            } else if (mode === 'ALTQ') {
+                btnFetAltQ.classList.add('active');
+                sendCommand("FET2:ALTQ");
+                
+                let currentDutyVal = parseInt(document.getElementById('dutyInput').value);
+                let liveDutyStr = document.getElementById('liveDuty').innerText;
+                let activeDuty = parseInt(liveDutyStr.split(" ")[0]);
+
+                if (!isNaN(activeDuty) && activeDuty > 50) {
+                    document.getElementById('dutyInput').value = 50;
+                    sendCommand("DUTY:50");
+                } else if (!isNaN(currentDutyVal) && currentDutyVal > 50) {
+                    document.getElementById('dutyInput').value = 50;
+                    sendCommand("DUTY:50");
+                }
+            }
+        }
+
+        btnFetCopy.addEventListener('click', () => updateFetMode('COPY'));
+        btnFetAlt.addEventListener('click', () => updateFetMode('ALT'));
+        btnFetAltQ.addEventListener('click', () => updateFetMode('ALTQ'));
+
+        // --- INCOMING TELEMETRY ---
+        let incomingBuffer = "";
+        function handleIncomingData(event) {
+            let decoder = new TextDecoder('utf-8');
+            incomingBuffer += decoder.decode(event.target.value);
+            let lines = incomingBuffer.split('\n');
+            incomingBuffer = lines.pop(); 
+            lines.forEach(line => {
+                line = line.trim();
+                if (line.startsWith("DUTY:")) {
+                    document.getElementById('liveDuty').innerText = line.split(":")[1] + " %";
+                } else if (line.startsWith("FREQ:")) {
+                    let f = parseInt(line.split(":")[1]);
+                    if (f >= 100000) document.getElementById('liveFreq').innerText = (f/1000).toFixed(0) + " kHz";
+                    else if (f >= 1000) document.getElementById('liveFreq').innerText = (f/1000).toFixed(1) + " kHz";
+                    else document.getElementById('liveFreq').innerText = f + " Hz";
+                } else if (line.startsWith("TEMP:")) {
+                    let valStr = line.split(":")[1];
+                    if (valStr !== "ERR") {
+                        let c = parseFloat(valStr);
+                        document.getElementById('liveTemp').innerText = `${c.toFixed(1)} °C | ${(c*9/5+32).toFixed(1)} °F`;
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+</html>
