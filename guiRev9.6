@@ -9,26 +9,42 @@ from datetime import datetime
 import os
 from PIL import Image
 
+# --- SUPABASE INTEGRATION ---
+from supabase import create_client, Client
+
+SUPABASE_URL = "https://lnmlgvlkhwyizubtlskp.supabase.co"
+SUPABASE_KEY = "sb_publishable_lTDc603U2Wajny-Wh4Zifw_nstCyyf1"
+
 ctk.set_appearance_mode("Light")
 
 class FETBoxController(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("FET Box Controller - Maroon Edition")
+        self.title("FET Box Controller - Aggie Edition")
         self.geometry("950x650")
         self.serial_connection = None
         self.heartbeat_running = False 
+        # Heartbeat thread and GUI thread both write to the port; without a lock
+        # their bytes can interleave and corrupt a command (e.g. "DUTHEARTBEAT...").
+        self.serial_lock = threading.Lock()
 
-        # Base path of the script for foolproof asset loading
+        # Base path of the script for reliable asset loading
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Initialize Supabase client
+        try:
+            self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            self.db_connected = True
+        except Exception as e:
+            print(f"Failed to connect to Supabase: {e}")
+            self.db_connected = False
 
         self.init_log_file()
 
         # ==========================================
         # TOP-LEVEL PERSISTENT THEME SWITCH
         # ==========================================
-        # Frame holding: [ "Light"  (Toggle)  "Dark" ]
         self.frame_theme = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_theme.place(relx=0.97, rely=0.03, anchor="ne")
 
@@ -66,7 +82,7 @@ class FETBoxController(ctk.CTk):
             self, 
             width=420, 
             height=370, 
-            fg_color="#500000",      # Aggie Maroon
+            fg_color="#500000",
             corner_radius=15,
             border_width=2, 
             border_color="#300000"
@@ -97,7 +113,7 @@ class FETBoxController(ctk.CTk):
         )
         self.entry_uin.pack(pady=10)
 
-        # Enter key support for login
+        # Enter key triggers authentication
         self.entry_uin.bind("<Return>", lambda event: self.attempt_login())
         self.entry_email.bind("<Return>", lambda event: self.attempt_login())
 
@@ -115,6 +131,9 @@ class FETBoxController(ctk.CTk):
         self.lbl_error = ctk.CTkLabel(self.frame_login, text="", text_color="#FF9999", font=("Arial", 12, "bold"))
         self.lbl_error.pack(pady=(0, 10))
 
+        if not self.db_connected:
+            self.lbl_error.configure(text="Warning: Cloud DB Offline. Local logs active.")
+
         # ==========================================
         # 2. BUILD MAIN UI (HIDDEN INITIALLY)
         # ==========================================
@@ -127,10 +146,10 @@ class FETBoxController(ctk.CTk):
             border_color=("#D3D3D3", "#333333")
         )
 
-        # Pin the logo in top-left without affecting the title layout
+        # Anchor TAMU logo in top-left corner
         self.load_logo(self.frame_controls)
 
-        # Centered CONTROLS title (matches LIVE MONITOR)
+        # Centered title
         ctk.CTkLabel(
             self.frame_controls, 
             text="CONTROLS", 
@@ -201,14 +220,26 @@ class FETBoxController(ctk.CTk):
         self.lbl_fet2 = ctk.CTkLabel(self.frame_controls, text="FET 2 Mode", font=("Arial", 14, "bold"), text_color=("black", "white"))
         self.lbl_fet2.pack(pady=(12, 5))
         
+        # Names match the legacy front panel (DD00003 sec. 6.2). Protocol tokens unchanged.
+        self.FET2_MODES = {
+            "Copy (q)":        ("COPY", "FET 2 switches identically to FET 1"),
+            "Complement (q')": ("ALT",  "FET 2 is the inverse of FET 1, with 150 ns dead time"),
+            "Alternate":       ("ALTQ", "FETs take turns; each runs at f/2 (scope duty reads half the set value)"),
+        }
         self.seg_fet2 = ctk.CTkSegmentedButton(
             self.frame_controls, 
-            values=["Copy (q)", "Alternate (q')", "Alt Pulses (altq)"], 
+            values=list(self.FET2_MODES.keys()), 
             command=self.send_config_update,
             selected_color="#500000", selected_hover_color="#3E0000"
         )
         self.seg_fet2.set("Copy (q)")
         self.seg_fet2.pack(pady=5)
+
+        self.lbl_mode_caption = ctk.CTkLabel(
+            self.frame_controls, text=self.FET2_MODES["Copy (q)"][1],
+            font=("Arial", 11), text_color="gray", wraplength=300
+        )
+        self.lbl_mode_caption.pack(pady=(0, 5))
 
         # --- RIGHT SIDE: LIVE DISPLAY ---
         self.frame_display = ctk.CTkFrame(
@@ -262,7 +293,6 @@ class FETBoxController(ctk.CTk):
             self.lbl_light.configure(text_color="black")
 
     def load_logo(self, parent_frame):
-        """Places tamu_logo.png in the corner without altering centered layouts."""
         logo_path = os.path.join(self.base_dir, "tamu_logo.png")
         try:
             if os.path.exists(logo_path):
@@ -284,21 +314,49 @@ class FETBoxController(ctk.CTk):
 
     def attempt_login(self):
         email = self.entry_email.get().strip().lower()
-        uin = self.entry_uin.get().strip()
+        uin_str = self.entry_uin.get().strip()
 
         if not email.endswith("@tamu.edu"):
             self.lbl_error.configure(text="Access Denied: Must use a @tamu.edu email.")
             return
         
-        if not uin.isdigit() or len(uin) != 9:
+        if not uin_str.isdigit() or len(uin_str) != 9:
             self.lbl_error.configure(text="Access Denied: Invalid 9-digit UIN.")
             return
+
+        uin_int = int(uin_str)
+
+        if self.db_connected:
+            self.btn_login.configure(text="Verifying Roster...")
+            self.update()
+            try:
+                response = self.supabase.table("roster").select("email, UIN").eq("email", email).eq("UIN", uin_int).execute()
+                
+                if not response.data:
+                    self.lbl_error.configure(text="Access Denied: Email and UIN do not match roster.")
+                    self.btn_login.configure(text="Authenticate")
+                    return
+                
+                try:
+                    self.supabase.table("user_sessions").insert({
+                        "email": email,
+                        "UIN": uin_int,
+                        "app_type": "FET Box GUI"
+                    }).execute()
+                except Exception as log_err:
+                    print(f"Non-critical: Cloud session log failure: {log_err}")
+
+            except Exception as e:
+                print(f"Database error: {e}")
+                self.lbl_error.configure(text="Database error: Check network connection.")
+                self.btn_login.configure(text="Authenticate")
+                return
 
         log_path = os.path.join(self.base_dir, "fet_usage_log.csv")
         with open(log_path, mode="a", newline="") as file:
             writer = csv.writer(file)
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            writer.writerow([timestamp, email, uin])
+            writer.writerow([timestamp, email, uin_str])
 
         self.frame_login.destroy()
         self.frame_controls.pack(side="left", fill="both", padx=20, pady=20, expand=True)
@@ -329,9 +387,9 @@ class FETBoxController(ctk.CTk):
             self.serial_connection.reset_input_buffer()
             self.serial_connection.reset_output_buffer()
             self.after(0, self._gui_connection_success)
-            self.heartbeat_running = True 
+            self.heartbeat_running = True
             threading.Thread(target=self.read_serial_data, daemon=True).start()
-            threading.Thread(target=self.send_heartbeat_loop, daemon=True).start() 
+            threading.Thread(target=self.send_heartbeat_loop, daemon=True).start()
             time.sleep(1.5) 
             self.send_command("CONN", "ON")
             self.send_config_update(None)
@@ -347,7 +405,8 @@ class FETBoxController(ctk.CTk):
         if self.serial_connection and self.serial_connection.is_open:
             try:
                 command_string = f"{cmd_type}:{value}\n"
-                self.serial_connection.write(command_string.encode('utf-8'))
+                with self.serial_lock:
+                    self.serial_connection.write(command_string.encode('utf-8'))
                 if cmd_type != "HEARTBEAT":    
                     print(f"Sent: {command_string.strip()}")
             except Exception:
@@ -381,13 +440,9 @@ class FETBoxController(ctk.CTk):
         self.send_command("SOURCE", src)
         
         gui_val = self.seg_fet2.get()
-        if gui_val == "Alternate (q')":
-            mode = "ALT"
-        elif gui_val == "Alt Pulses (altq)":
-            mode = "ALTQ"
-        else:
-            mode = "COPY"
-            
+        mode, caption = self.FET2_MODES.get(gui_val, self.FET2_MODES["Copy (q)"])
+        # send_config_update can be called from the connect thread; touch Tk on the main thread.
+        self.after(0, lambda c=caption: self.lbl_mode_caption.configure(text=c))
         self.send_command("FET2", mode)
 
     def read_serial_data(self):
