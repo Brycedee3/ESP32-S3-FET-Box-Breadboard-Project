@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FET Box Wireless Controller</title>
+    <style>
+        :root {
+            --bg-color: #f4f4f9;
+            --panel-bg: #ffffff;
+            --text-color: #333333;
+            --tamu-maroon: #500000;
+            --tamu-maroon-hover: #3E0000;
+            --input-bg: #ffffff;
+            --input-border: #888888;
+            --divider: #cccccc;
+            --shadow: 0 4px 15px rgba(0,0,0,0.1);
+            --btn-gray: #7A8B99;
+            --btn-gray-hover: #5C6A75;
+        }
+
+        [data-theme="dark"] {
+            --bg-color: #1a1a1a;
+            --panel-bg: #1E1E1E;
+            --text-color: #ffffff;
+            --tamu-maroon: #500000; 
+            --tamu-maroon-hover: #700000;
+            --input-bg: #2b2b2b;
+            --input-border: #555555;
+            --divider: #444444;
+            --shadow: 0 4px 15px rgba(0,0,0,0.5);
+            --btn-gray: #7A8B99;
+            --btn-gray-hover: #9ea7ad;
+        }
+
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background-color: var(--bg-color); 
+            color: var(--text-color); 
+            margin: 0; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh;
+            overflow: hidden;
+            transition: background-color 0.3s, color 0.3s;
+        }
+
+        /* --- LOGIN OVERLAY --- */
+        #loginOverlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background-color: var(--bg-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .login-box {
+            width: 400px;
+            background-color: var(--tamu-maroon);
+            padding: 40px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: var(--shadow);
+            border: 2px solid #300000;
+        }
+        .login-box h2 { color: white; margin-bottom: 5px; font-weight: 900; font-size: 26px; }
+        .login-box p { color: #E0D0D0; font-size: 14px; margin-bottom: 25px; font-weight: bold; }
+        .login-box input { 
+            width: 75%; padding: 10px; margin-bottom: 15px; 
+            border-radius: 6px; border: none; 
+            background-color: white; color: black;
+            font-size: 14px; text-align: center;
+        }
+        .btn-auth { background-color: white; color: var(--tamu-maroon); width: 50%; padding: 10px; font-weight: bold; font-size: 14px; border: none; border-radius: 6px; cursor: pointer; transition: 0.2s; }
+        .btn-auth:hover { background-color: #E0E0E0; }
+        #loginError { color: #FF9999; font-size: 13px; margin-top: 15px; min-height: 15px; font-weight: bold; }
+
+        /* --- MAIN GUI --- */
+        #mainGui {
+            display: none; 
+            width: 950px; /* Increased from 900px */
+            height: 650px; /* Increased from 600px */
+            justify-content: space-between;
+            padding: 20px;
+            position: relative;
+        }
+        .panel {
+            width: 400px; /* Slightly wider to match new layout */
+            background-color: var(--panel-bg); 
+            border-radius: 8px; padding: 25px;
+            display: flex; flex-direction: column; align-items: center;
+            box-shadow: var(--shadow);
+            border: 1px solid var(--divider);
+            box-sizing: border-box;
+            position: relative;
+        }
+        .tamu-logo {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 48px;
+            height: auto;
+        }
+        .section-title { font-size: 22px; font-weight: 900; color: var(--tamu-maroon); margin-bottom: 10px; letter-spacing: 1px; }
+        [data-theme="dark"] .section-title { color: #FF7777; }
+        
+        .control-label { font-size: 15px; font-weight: bold; margin: 8px 0 5px 0; color: var(--text-color); text-align: center; }
+        
+        input[type="number"] { width: 160px; padding: 10px; border-radius: 6px; border: 2px solid var(--input-border); background-color: var(--input-bg); color: var(--text-color); font-size: 15px; text-align: center; margin-bottom: 10px; }
+        
+        .action-btn { width: 160px; padding: 10px; background-color: var(--tamu-maroon); border: none; border-radius: 6px; color: white; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 14px; }
+        .action-btn:hover { background-color: var(--tamu-maroon-hover); }
+
+        .freq-multiplier-group { display: flex; gap: 8px; margin-bottom: 10px; justify-content: center; }
+        .freq-btn { background-color: var(--btn-gray); color: white; border: none; border-radius: 6px; padding: 8px 12px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        .freq-btn:hover { background-color: var(--btn-gray-hover); }
+
+        .divider { color: var(--divider); margin: 12px 0; letter-spacing: 2px; font-size: 12px; }
+        
+        /* --- FIXED TOGGLE GROUP USING DIVS --- */
+        .toggle-group { 
+            display: flex; 
+            width: 100%; 
+            margin-bottom: 10px; 
+            border-radius: 6px;
+            background-color: var(--btn-gray);
+        }
+        .toggle-btn { 
+            flex: 1; 
+            padding: 12px 0; 
+            cursor: pointer; 
+            color: white; 
+            text-align: center;
+            font-weight: bold; 
+            font-size: 14px; 
+            border-right: 1px solid rgba(255, 255, 255, 0.2);
+            transition: background-color 0.2s; 
+            user-select: none; 
+        }
+        .toggle-btn:first-child { border-top-left-radius: 6px; border-bottom-left-radius: 6px; }
+        .toggle-btn:last-child { border-top-right-radius: 6px; border-bottom-right-radius: 6px; border-right: none; }
+        .toggle-btn.active { background-color: var(--tamu-maroon); }
+        
+        .mode-caption { font-size: 12px; color: gray; text-align: center; min-height: 32px; margin-bottom: 4px; }
+        .clamp-note { font-size: 12px; color: var(--tamu-maroon); font-weight: bold; min-height: 16px; margin-top: -18px; margin-bottom: 10px; text-align: center; }
+        [data-theme="dark"] .clamp-note { color: #FF7777; }
+
+        .monitor-title { font-size: 15px; margin-bottom: 5px; color: gray; font-weight: bold; }
+        .monitor-data { font-size: 42px; font-weight: bold; color: var(--text-color); margin-bottom: 25px; }
+        .monitor-data.alert { color: var(--tamu-maroon); font-size: 38px; }
+        [data-theme="dark"] .monitor-data.alert { color: #FF7777; }
+        
+        .connection-area { display: flex; align-items: center; justify-content: center; margin-top: auto; width: 100%; gap: 15px; }
+        .status-light { width: 18px; height: 18px; border-radius: 50%; background-color: red; box-shadow: 0 0 8px rgba(0,0,0,0.5); }
+        .btn-connect { background-color: green; color: white; padding: 12px 20px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 14px; } 
+        .btn-disconnect { background-color: darkred; color: white; padding: 12px 20px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 14px; }
+
+        .top-bar { position: absolute; top: -35px; right: 0; display: flex; gap: 15px; align-items: center; }
+        .branding { position: absolute; bottom: -25px; right: 0; font-size: 11px; font-style: italic; color: gray; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="loginOverlay">
+        <div class="login-box">
+            <h2>Student Login</h2>
+            <p>Equipment Access Restricted</p>
+            <input type="text" id="emailInput" placeholder="Email (@tamu.edu)">
+            <input type="password" id="uinInput" placeholder="9-Digit UIN">
+            <button class="btn-auth" id="loginBtn">Authenticate</button>
+            <div id="loginError"></div>
+        </div>
+    </div>
+
+    <div id="mainGui" class="main-window">
+        <div class="top-bar">
+            <span style="font-size: 14px; font-weight: bold; margin-right: -10px;">Light</span>
+            <label style="position: relative; display: inline-block; width: 46px; height: 24px;">
+                <input type="checkbox" id="themeToggleBox" style="opacity: 0; width: 0; height: 0;">
+                <span id="themeSlider" style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--tamu-maroon); border-radius: 24px; transition: .4s;">
+                    <span id="themeSliderKnob" style="position: absolute; content: ''; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; border-radius: 50%; transition: .4s;"></span>
+                </span>
+            </label>
+            <span style="font-size: 14px; font-weight: bold; margin-left: 5px;">Dark</span>
+        </div>
+
+        <div class="panel">
+            <img src="tamu_logo.png" alt="TAMU" class="tamu-logo" onerror="this.style.display='none'">
+            <div class="section-title">CONTROLS</div>
+            
+            <div class="control-label">Set Duty Cycle (%)</div>
+            <input type="number" id="dutyInput" placeholder="e.g., 50" min="0" max="100">
+            <button id="sendDutyBtn" class="action-btn">Send Duty</button>
+            
+            <div class="divider">-------------------------</div>
+            
+            <div class="control-label">Set Frequency (Hz)</div>
+            <input type="number" id="freqInput" placeholder="e.g., 5000" min="20" max="500000">
+            <div class="freq-multiplier-group">
+                <button class="freq-btn" onclick="applyFreqMultiplier(1)">Hz</button>
+                <button class="freq-btn" onclick="applyFreqMultiplier(1000)">kHz</button>
+                <button class="freq-btn" onclick="applyFreqMultiplier(100000)">100kHz</button>
+            </div>
+            <button id="sendFreqBtn" class="action-btn">Send Frequency</button>
+            
+            <div class="divider">-------------------------</div>
+            
+            <div class="control-label">Signal Source q(t)</div>
+            <div class="toggle-group">
+                <div id="btnSrcInt" class="toggle-btn active">Internal</div>
+                <div id="btnSrcExt" class="toggle-btn">External</div>
+            </div>
+            
+            <div class="control-label">FET 2 Mode</div>
+            <div class="toggle-group">
+                <div id="btnFetCopy" class="toggle-btn active" title="FET 2 switches identically to FET 1">Copy (q)</div>
+                <div id="btnFetAlt" class="toggle-btn" title="FET 2 is the inverse of FET 1, with dead time">Complement (q')</div>
+                <div id="btnFetAltQ" class="toggle-btn" title="FETs take turns, each at half the frequency">Alternate</div>
+            </div>
+            <div class="mode-caption" id="modeCaption"></div>
+        </div>
+
+        <div class="panel">
+            <div class="section-title">LIVE MONITOR</div>
+            
+            <div class="monitor-title">Current Duty</div>
+            <div class="monitor-data" id="liveDuty">-- %</div>
+            <div class="clamp-note" id="clampNote"></div>
+            
+            <div class="monitor-title">Current Freq</div>
+            <div class="monitor-data" id="liveFreq">-- Hz</div>
+            
+            <div class="monitor-title">Hardware Temperature</div>
+            <div class="monitor-data alert" id="liveTemp">-- °C | -- °F</div>
+            
+            <div class="connection-area">
+                <div class="status-light" id="statusLight"></div>
+                <button id="connectBtn" class="btn-connect">Connect</button>
+            </div>
+        </div>
+        <div class="branding">Created by the Balog Bros</div>
+    </div>
+
+    <script>
+        // --- THEME MANAGEMENT ---
+        const themeToggleBox = document.getElementById('themeToggleBox');
+        const themeSliderKnob = document.getElementById('themeSliderKnob');
+        const savedTheme = localStorage.getItem('fetBoxTheme') || 'light';
+        
+        function applyTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            if (theme === 'dark') {
+                themeToggleBox.checked = true;
+                themeSliderKnob.style.transform = 'translateX(22px)';
+            } else {
+                themeToggleBox.checked = false;
+                themeSliderKnob.style.transform = 'translateX(0)';
+            }
+        }
+        
+        applyTheme(savedTheme);
+
+        themeToggleBox.addEventListener('change', (e) => {
+            const newTheme = e.target.checked ? 'dark' : 'light';
+            localStorage.setItem('fetBoxTheme', newTheme);
+            applyTheme(newTheme);
+        });
+
+        // --- BLUETOOTH CONFIG ---
+        const bleServiceUUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+        const bleRxUUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; 
+        const bleTxUUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; 
+
+        let bluetoothDevice;
+        let rxCharacteristic;
+        let txCharacteristic;
+        let heartbeatInterval;
+        let currentFetMode = "COPY";
+        let currentSource = "INT";
+        let lastRequestedDuty = null;
+
+        // --- SUPABASE CONFIG ---
+        const SUPABASE_URL = "https://lnmlgvlkhwyizubtlskp.supabase.co/";
+        const SUPABASE_KEY = "sb_publishable_lTDc603U2Wajny-Wh4Zifw_nstCyyf1";
+
+        // ==========================================
+        // 1. SUPABASE AUTH & LOGGING
+        // ==========================================
+        const loginBtn = document.getElementById('loginBtn');
+        const emailInput = document.getElementById('emailInput');
+        const uinInput = document.getElementById('uinInput');
+        const errorLabel = document.getElementById('loginError');
+
+        emailInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') uinInput.focus(); });
+        uinInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') loginBtn.click(); });
+
+        loginBtn.addEventListener('click', async () => {
+            const email = emailInput.value.trim().toLowerCase();
+            const uin = uinInput.value.trim();
+
+            if (!email.endsWith("@tamu.edu")) {
+                errorLabel.innerText = "Access Denied: Must use a @tamu.edu email.";
+                return;
+            }
+            if (uin.length !== 9 || isNaN(uin)) {
+                errorLabel.innerText = "Access Denied: Invalid 9-digit UIN.";
+                return;
+            }
+
+            errorLabel.style.color = "var(--text-color)";
+            errorLabel.innerText = "Verifying roster...";
+
+            try {
+                let rosterResponse = await fetch(`${SUPABASE_URL}rest/v1/roster?email=eq.${encodeURIComponent(email)}&select=UIN`, {
+                    method: 'GET',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_KEY}`
+                    }
+                });
+
+                if (!rosterResponse.ok) throw new Error("Failed to fetch roster");
+                let rosterData = await rosterResponse.json();
+
+                if (rosterData.length === 0) {
+                    errorLabel.style.color = "#FF9999";
+                    errorLabel.innerText = "Access Denied: Email not found in roster.";
+                    return;
+                }
+                
+                if (String(rosterData[0].UIN) !== uin) {
+                    errorLabel.style.color = "#FF9999";
+                    errorLabel.innerText = "Access Denied: UIN does not match roster records.";
+                    return;
+                }
+
+                await fetch(`${SUPABASE_URL}rest/v1/user_sessions`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_KEY}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        email: email, 
+                        UIN: parseInt(uin),
+                        app_type: "Web GUI"
+                    })
+                });
+
+                document.getElementById('loginOverlay').style.display = 'none';
+                document.getElementById('mainGui').style.display = 'flex';
+
+            } catch (err) { 
+                console.error("Database log failed", err); 
+                errorLabel.style.color = "#FF9999";
+                errorLabel.innerText = "Network Error: Could not reach Supabase.";
+            }
+        });
+
+        // ==========================================
+        // 2. HARDWARE & BLE LOGIC
+        // ==========================================
+        const connectBtn = document.getElementById('connectBtn');
+        const statusLight = document.getElementById('statusLight');
+
+        // Connection state
+        let userDisconnecting = false;   // true only when the user clicks Disconnect
+        let reconnecting = false;
+        let disconnectListenerAdded = false;
+        let writeFailures = 0;
+        const MAX_WRITE_FAILURES = 3;
+        const RECONNECT_WINDOW_MS = 15000;
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        function showConnected() {
+            statusLight.style.backgroundColor = "#00FF00";
+            statusLight.style.boxShadow = "0 0 10px #00FF00";
+            connectBtn.innerText = "Disconnect";
+            connectBtn.className = "btn-disconnect";
+            connectBtn.style.backgroundColor = "";
+        }
+        function showReconnecting() {
+            statusLight.style.backgroundColor = "orange";
+            statusLight.style.boxShadow = "0 0 10px orange";
+            connectBtn.innerText = "Reconnecting... (click to stop)";
+            connectBtn.className = "btn-connect";
+            connectBtn.style.backgroundColor = "orange";
+        }
+        function showDisconnected() {
+            statusLight.style.backgroundColor = "red";
+            statusLight.style.boxShadow = "0 0 8px rgba(0,0,0,0.5)";
+            connectBtn.innerText = "Connect";
+            connectBtn.className = "btn-connect";
+            connectBtn.style.backgroundColor = "";
+        }
+
+        // Open GATT on the already-chosen device and start talking. Throws on failure.
+        async function openGatt() {
+            const server = await bluetoothDevice.gatt.connect();
+            const service = await server.getPrimaryService(bleServiceUUID);
+            rxCharacteristic = await service.getCharacteristic(bleRxUUID);
+            txCharacteristic = await service.getCharacteristic(bleTxUUID);
+            await txCharacteristic.startNotifications();
+            txCharacteristic.addEventListener('characteristicvaluechanged', handleIncomingData);
+
+            writeFailures = 0;
+            showConnected();
+
+            sendCommand("CONN:ON");
+            sendCommand(currentSource === "EXT" ? "SOURCE:EXT" : "SOURCE:INT");
+            // FET 2 mode is NOT pushed here: the box's panel switch sets it, and the
+            // box reports it back (FET2:...) on CONN:ON so the buttons match the hardware.
+            // 500 ms heartbeat vs. 3000 ms firmware watchdog.
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = setInterval(() => sendCommand("HEARTBEAT:1", true), 500);
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            // Stop an auto-reconnect in progress
+            if (reconnecting) {
+                userDisconnecting = true;
+                reconnecting = false;
+                showDisconnected();
+                return;
+            }
+            // User disconnect
+            if (bluetoothDevice && bluetoothDevice.gatt.connected) {
+                userDisconnecting = true;
+                await Promise.race([sendCommand("CONN:OFF"), sleep(500)]);
+                bluetoothDevice.gatt.disconnect();
+                return;
+            }
+            // New connection
+            try {
+                userDisconnecting = false;
+                connectBtn.innerText = "Connecting...";
+                connectBtn.style.backgroundColor = "orange";
+
+                const dev = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'FET_Box_BLE' }],
+                    optionalServices: [bleServiceUUID]
+                });
+                if (dev !== bluetoothDevice) disconnectListenerAdded = false;
+                bluetoothDevice = dev;
+                if (!disconnectListenerAdded) {
+                    bluetoothDevice.addEventListener('gattserverdisconnected', onDisconnected);
+                    disconnectListenerAdded = true;
+                }
+                await openGatt();
+            } catch (error) {
+                console.error("Connect failed:", error);
+                cleanupLink();
+                showDisconnected();
+            }
+        });
+
+        function cleanupLink() {
+            clearInterval(heartbeatInterval);
+            rxCharacteristic = null;
+            bleQueue = Promise.resolve();
+            heartbeatPending = false;
+        }
+
+        function onDisconnected() {
+            cleanupLink();
+            if (userDisconnecting || !bluetoothDevice) {
+                showDisconnected();
+                return;
+            }
+            // Unexpected drop: try to get back before the box's 3 s watchdog trips.
+            reconnectLoop();
+        }
+
+        async function reconnectLoop() {
+            if (reconnecting) return;
+            reconnecting = true;
+            showReconnecting();
+            const start = Date.now();
+            let attempt = 0;
+            while (reconnecting && !userDisconnecting && Date.now() - start < RECONNECT_WINDOW_MS) {
+                attempt++;
+                await sleep(300);
+                try {
+                    await openGatt();
+                    console.log(`Reconnected on attempt ${attempt} after ${((Date.now() - start) / 1000).toFixed(1)} s`);
+                    reconnecting = false;
+                    return;
+                } catch (e) {
+                    // device not reachable yet; keep trying
+                }
+            }
+            if (reconnecting) console.warn(`Reconnect failed after ${RECONNECT_WINDOW_MS / 1000} s`);
+            reconnecting = false;
+            cleanupLink();
+            showDisconnected();
+        }
+
+        // Web Bluetooth rejects a write while another GATT operation is in flight
+        // ("GATT operation already in progress"), so every write is chained onto
+        // one promise queue and runs strictly in order.
+        let bleQueue = Promise.resolve();
+        let heartbeatPending = false;
+        const bleEncoder = new TextEncoder();
+
+        function sendCommand(commandString, isHeartbeat = false) {
+            if (!rxCharacteristic) return Promise.resolve();
+            // Don't let heartbeats pile up behind a slow link; one queued is enough.
+            if (isHeartbeat) {
+                if (heartbeatPending) return bleQueue;
+                heartbeatPending = true;
+            }
+            const data = bleEncoder.encode(commandString + '\n');
+            bleQueue = bleQueue
+                .then(async () => {
+                    if (isHeartbeat) heartbeatPending = false;
+                    if (!rxCharacteristic) return;
+                    await rxCharacteristic.writeValue(data);
+                    writeFailures = 0;
+                })
+                .catch(err => {
+                    writeFailures++;
+                    console.error(`BLE write failed (${writeFailures}/${MAX_WRITE_FAILURES}):`, commandString, err);
+                    // Repeated failures = link is dead even if no disconnect event fired.
+                    // Dropping GATT triggers onDisconnected -> auto-reconnect.
+                    if (writeFailures >= MAX_WRITE_FAILURES && bluetoothDevice && bluetoothDevice.gatt.connected) {
+                        writeFailures = 0;
+                        bluetoothDevice.gatt.disconnect();
+                    }
+                });
+            return bleQueue;
+        }
+
+        // --- COMMAND CLAMPING & MULTIPLIERS ---
+        const sendDutyBtn = document.getElementById('sendDutyBtn');
+        const dutyInput = document.getElementById('dutyInput');
+        const sendFreqBtn = document.getElementById('sendFreqBtn');
+        const freqInput = document.getElementById('freqInput');
+
+        dutyInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendDutyBtn.click(); });
+        freqInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendFreqBtn.click(); });
+
+        sendDutyBtn.addEventListener('click', () => {
+            let val = parseInt(dutyInput.value);
+            if (!isNaN(val)) {
+                // Firmware owns the limits (incl. the Alternate-mode overlap clamp)
+                // and echoes back the value it actually applied.
+                val = Math.max(0, Math.min(100, val));
+                dutyInput.value = val;
+                lastRequestedDuty = val;
+                sendCommand("DUTY:" + val);
+            }
+        });
+
+        window.applyFreqMultiplier = function(multiplier) {
+            let baseVal = parseFloat(freqInput.value);
+            if (!isNaN(baseVal)) {
+                let finalFreq = Math.round(baseVal * multiplier);
+                freqInput.value = finalFreq;
+                sendCommand("FREQ:" + finalFreq);
+            }
+        };
+
+        sendFreqBtn.addEventListener('click', () => {
+            let val = parseInt(freqInput.value);
+            if (!isNaN(val)) {
+                sendCommand("FREQ:" + val);
+            }
+        });
+
+        // --- TOGGLE EVENT LISTENERS ---
+        const btnSrcInt = document.getElementById('btnSrcInt');
+        const btnSrcExt = document.getElementById('btnSrcExt');
+        
+        btnSrcInt.addEventListener('click', () => {
+            btnSrcInt.classList.add('active'); btnSrcExt.classList.remove('active');
+            currentSource = "INT";
+            sendCommand("SOURCE:INT");
+        });
+        btnSrcExt.addEventListener('click', () => {
+            btnSrcExt.classList.add('active'); btnSrcInt.classList.remove('active');
+            currentSource = "EXT";
+            sendCommand("SOURCE:EXT");
+        });
+
+        const btnFetCopy = document.getElementById('btnFetCopy');
+        const btnFetAlt = document.getElementById('btnFetAlt');
+        const btnFetAltQ = document.getElementById('btnFetAltQ');
+
+        // Names match the legacy front panel (DD00003 sec. 6.2): [q,q], [q,q'], [Alt q, Alt q].
+        // Protocol tokens (COPY / ALT / ALTQ) are unchanged so firmware needs no edits.
+        const MODE_CAPTIONS = {
+            COPY: "FET 2 switches identically to FET 1",
+            ALT:  "FET 2 is the inverse of FET 1, with 150 ns dead time",
+            ALTQ: "FETs take turns; each runs at f/2 (scope duty reads half the set value)"
+        };
+
+        // Update the buttons only (used when the box reports its mode, e.g. panel switch moved).
+        function setFetModeUI(mode) {
+            if (!MODE_CAPTIONS[mode]) return;
+            currentFetMode = mode;
+            btnFetCopy.classList.toggle('active', mode === 'COPY');
+            btnFetAlt.classList.toggle('active', mode === 'ALT');
+            btnFetAltQ.classList.toggle('active', mode === 'ALTQ');
+            document.getElementById('modeCaption').innerText = MODE_CAPTIONS[mode];
+        }
+
+        // User clicked a mode button: update UI and tell the box.
+        function updateFetMode(mode) {
+            setFetModeUI(mode);
+            // No client-side duty cap: firmware clamps for Alternate mode and replies with DUTY:.
+            sendCommand("FET2:" + mode);
+        }
+
+        document.getElementById('modeCaption').innerText = MODE_CAPTIONS[currentFetMode];
+
+        btnFetCopy.addEventListener('click', () => updateFetMode('COPY'));
+        btnFetAlt.addEventListener('click', () => updateFetMode('ALT'));
+        btnFetAltQ.addEventListener('click', () => updateFetMode('ALTQ'));
+
+        // --- INCOMING TELEMETRY ---
+        let incomingBuffer = "";
+        function handleIncomingData(event) {
+            let decoder = new TextDecoder('utf-8');
+            incomingBuffer += decoder.decode(event.target.value);
+            let lines = incomingBuffer.split('\n');
+            incomingBuffer = lines.pop(); 
+            lines.forEach(line => {
+                line = line.trim();
+                if (line.startsWith("DUTY:")) {
+                    const applied = parseInt(line.split(":")[1]);
+                    document.getElementById('liveDuty').innerText = applied + " %";
+                    const note = document.getElementById('clampNote');
+                    if (lastRequestedDuty !== null && !isNaN(applied) && applied < lastRequestedDuty) {
+                        note.innerText = `Limited to ${applied}% (requested ${lastRequestedDuty}%)`;
+                    } else {
+                        note.innerText = "";
+                    }
+                } else if (line.startsWith("FET2:")) {
+                    setFetModeUI(line.split(":")[1].trim());
+                } else if (line.startsWith("FREQ:")) {
+                    let f = parseInt(line.split(":")[1]);
+                    document.getElementById('liveFreq').innerText = f + " Hz";
+                } else if (line.startsWith("TEMP:")) {
+                    let valStr = line.split(":")[1];
+                    if (valStr !== "ERR") {
+                        let c = parseFloat(valStr);
+                        let f = (c * 9/5) + 32;
+                        document.getElementById('liveTemp').innerText = `${c.toFixed(1)} °C | ${f.toFixed(1)} °F`;
+                    } else {
+                        document.getElementById('liveTemp').innerText = "ERR";
+                    }
+                }
+            });
+        }
+    </script>
+</body>
+</html>
