@@ -1,0 +1,618 @@
+import customtkinter as ctk
+import serial
+import serial.tools.list_ports
+import threading
+import queue
+import time
+import traceback
+import csv
+from datetime import datetime
+import os
+from PIL import Image
+
+# --- SUPABASE INTEGRATION ---
+from supabase import create_client, Client
+
+SUPABASE_URL = "https://lnmlgvlkhwyizubtlskp.supabase.co"
+SUPABASE_KEY = "sb_publishable_lTDc603U2Wajny-Wh4Zifw_nstCyyf1"
+
+ctk.set_appearance_mode("Light")
+
+class FETBoxController(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("FET Box Controller - Aggie Edition")
+        self.geometry("950x650")
+        self.serial_connection = None
+        self.heartbeat_running = False 
+        # Heartbeat thread and GUI thread both write to the port; without a lock
+        # their bytes can interleave and corrupt a command (e.g. "DUTHEARTBEAT...").
+        self.serial_lock = threading.Lock()
+        # All writes go through one queue + one writer thread. Button handlers only
+        # enqueue, so a stalled USB link can never freeze the GUI.
+        self.tx_queue = queue.Queue()
+        self.link_up = False
+        self.current_port = None         # remembered for auto-reconnect
+        self.user_disconnecting = False  # True only when the user clicks Disconnect
+        self.reconnecting = False
+
+        # Base path of the script for reliable asset loading
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Initialize Supabase client
+        try:
+            self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            self.db_connected = True
+        except Exception as e:
+            print(f"Failed to connect to Supabase: {e}")
+            self.db_connected = False
+
+        self.init_log_file()
+
+        # ==========================================
+        # TOP-LEVEL PERSISTENT THEME SWITCH
+        # ==========================================
+        self.frame_theme = ctk.CTkFrame(self, fg_color="transparent")
+        self.frame_theme.place(relx=0.97, rely=0.03, anchor="ne")
+
+        self.lbl_light = ctk.CTkLabel(
+            self.frame_theme, 
+            text="Light", 
+            font=("Arial", 12, "bold"), 
+            text_color=("black", "gray")
+        )
+        self.lbl_light.pack(side="left", padx=(0, 6))
+
+        self.switch_theme = ctk.CTkSwitch(
+            self.frame_theme, 
+            text="", 
+            width=46,
+            command=self.toggle_appearance_mode,
+            progress_color="#500000",
+            button_color="#500000",
+            button_hover_color="#3E0000"
+        )
+        self.switch_theme.pack(side="left")
+
+        self.lbl_dark = ctk.CTkLabel(
+            self.frame_theme, 
+            text="Dark", 
+            font=("Arial", 12, "bold"), 
+            text_color=("gray", "white")
+        )
+        self.lbl_dark.pack(side="left", padx=(6, 0))
+
+        # ==========================================
+        # 1. BUILD LOGIN SCREEN (Aggie Maroon Theme)
+        # ==========================================
+        self.frame_login = ctk.CTkFrame(
+            self, 
+            width=420, 
+            height=370, 
+            fg_color="#500000",
+            corner_radius=15,
+            border_width=2, 
+            border_color="#300000"
+        )
+        self.frame_login.place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(self.frame_login, text="Student Login", font=("Arial", 26, "bold"), text_color="white").pack(pady=(25, 5))
+        ctk.CTkLabel(self.frame_login, text="Equipment Access Restricted", text_color="#E0D0D0", font=("Arial", 12)).pack(pady=(0, 20))
+
+        self.entry_email = ctk.CTkEntry(
+            self.frame_login, 
+            placeholder_text="Email (@tamu.edu)", 
+            width=260, 
+            fg_color="white", 
+            text_color="black",
+            placeholder_text_color="gray"
+        )
+        self.entry_email.pack(pady=10)
+        
+        self.entry_uin = ctk.CTkEntry(
+            self.frame_login, 
+            placeholder_text="9-Digit UIN", 
+            width=260, 
+            show="*", 
+            fg_color="white", 
+            text_color="black",
+            placeholder_text_color="gray"
+        )
+        self.entry_uin.pack(pady=10)
+
+        # Enter key triggers authentication
+        self.entry_uin.bind("<Return>", lambda event: self.attempt_login())
+        self.entry_email.bind("<Return>", lambda event: self.attempt_login())
+
+        self.btn_login = ctk.CTkButton(
+            self.frame_login, 
+            text="Authenticate", 
+            command=self.attempt_login, 
+            fg_color="white", 
+            text_color="#500000", 
+            hover_color="#E0E0E0",
+            font=("Arial", 14, "bold")
+        )
+        self.btn_login.pack(pady=20)
+
+        self.lbl_error = ctk.CTkLabel(self.frame_login, text="", text_color="#FF9999", font=("Arial", 12, "bold"))
+        self.lbl_error.pack(pady=(0, 10))
+
+        if not self.db_connected:
+            self.lbl_error.configure(text="Warning: Cloud DB Offline. Local logs active.")
+
+        # ==========================================
+        # 2. BUILD MAIN UI (HIDDEN INITIALLY)
+        # ==========================================
+        # --- LEFT SIDE: CONTROLS ---
+        self.frame_controls = ctk.CTkFrame(
+            self, 
+            width=370, 
+            fg_color=("#F8F8F8", "#1E1E1E"), 
+            border_width=1, 
+            border_color=("#D3D3D3", "#333333")
+        )
+
+        # Anchor TAMU logo in top-left corner
+        self.load_logo(self.frame_controls)
+
+        # Centered title
+        ctk.CTkLabel(
+            self.frame_controls, 
+            text="CONTROLS", 
+            font=("Arial", 22, "bold"), 
+            text_color=("#500000", "#FF7777")
+        ).pack(pady=(15, 20))
+
+        self.lbl_duty = ctk.CTkLabel(self.frame_controls, text="Set Duty Cycle (%)", font=("Arial", 14, "bold"), text_color=("black", "white"))
+        self.lbl_duty.pack(pady=(15, 5))
+        self.entry_duty = ctk.CTkEntry(self.frame_controls, placeholder_text="e.g., 50", width=140)
+        self.entry_duty.pack(pady=5)
+        self.entry_duty.bind("<Return>", lambda event: self.update_duty())
+
+        self.btn_duty = ctk.CTkButton(self.frame_controls, text="Send Duty", command=self.update_duty, fg_color="#500000", hover_color="#3E0000")
+        self.btn_duty.pack(pady=5)
+
+        self.divider1 = ctk.CTkLabel(self.frame_controls, text="-------------------", text_color="gray")
+        self.divider1.pack(pady=5)
+
+        self.lbl_freq = ctk.CTkLabel(self.frame_controls, text="Set Frequency (Hz)", font=("Arial", 14, "bold"), text_color=("black", "white"))
+        self.lbl_freq.pack(pady=(5, 5))
+        self.entry_freq = ctk.CTkEntry(self.frame_controls, placeholder_text="e.g., 5000", width=140)
+        self.entry_freq.pack(pady=5)
+        self.entry_freq.bind("<Return>", lambda event: self.update_freq())
+
+        # 3 Multiplier Quick-Buttons
+        self.frame_freq_btns = ctk.CTkFrame(self.frame_controls, fg_color="transparent")
+        self.frame_freq_btns.pack(pady=4)
+        
+        self.btn_freq_hz = ctk.CTkButton(
+            self.frame_freq_btns, text="Hz", width=55, 
+            command=lambda: self.apply_freq_multiplier(1), 
+            fg_color="#7A8B99", hover_color="#5C6A75"
+        )
+        self.btn_freq_hz.pack(side="left", padx=3)
+
+        self.btn_freq_k = ctk.CTkButton(
+            self.frame_freq_btns, text="kHz", width=55, 
+            command=lambda: self.apply_freq_multiplier(1000), 
+            fg_color="#7A8B99", hover_color="#5C6A75"
+        )
+        self.btn_freq_k.pack(side="left", padx=3)
+
+        self.btn_freq_100k = ctk.CTkButton(
+            self.frame_freq_btns, text="100kHz", width=68, 
+            command=lambda: self.apply_freq_multiplier(100000), 
+            fg_color="#7A8B99", hover_color="#5C6A75"
+        )
+        self.btn_freq_100k.pack(side="left", padx=3)
+
+        self.btn_freq = ctk.CTkButton(self.frame_controls, text="Send Frequency", command=self.update_freq, fg_color="#500000", hover_color="#3E0000")
+        self.btn_freq.pack(pady=5)
+
+        self.divider2 = ctk.CTkLabel(self.frame_controls, text="-------------------", text_color="gray")
+        self.divider2.pack(pady=5)
+
+        self.lbl_source = ctk.CTkLabel(self.frame_controls, text="Signal Source q(t)", font=("Arial", 14, "bold"), text_color=("black", "white"))
+        self.lbl_source.pack(pady=(5, 5))
+        self.seg_source = ctk.CTkSegmentedButton(
+            self.frame_controls, 
+            values=["Internal", "External"], 
+            command=self.send_config_update, 
+            selected_color="#500000", selected_hover_color="#3E0000"
+        )
+        self.seg_source.set("Internal")
+        self.seg_source.pack(pady=5)
+
+        self.lbl_fet2 = ctk.CTkLabel(self.frame_controls, text="FET 2 Mode", font=("Arial", 14, "bold"), text_color=("black", "white"))
+        self.lbl_fet2.pack(pady=(12, 5))
+        
+        # Names match the legacy front panel (DD00003 sec. 6.2). Protocol tokens unchanged.
+        self.FET2_MODES = {
+            "Copy (q)":        ("COPY", "FET 2 switches identically to FET 1"),
+            "Complement (q')": ("ALT",  "FET 2 is the inverse of FET 1, with 150 ns dead time"),
+            "Alternate":       ("ALTQ", "FETs take turns; each runs at f/2 (scope duty reads half the set value)"),
+        }
+        self.seg_fet2 = ctk.CTkSegmentedButton(
+            self.frame_controls, 
+            values=list(self.FET2_MODES.keys()), 
+            command=self.send_config_update,
+            selected_color="#500000", selected_hover_color="#3E0000"
+        )
+        self.seg_fet2.set("Copy (q)")
+        self.seg_fet2.pack(pady=5)
+
+        self.lbl_mode_caption = ctk.CTkLabel(
+            self.frame_controls, text=self.FET2_MODES["Copy (q)"][1],
+            font=("Arial", 11), text_color="gray", wraplength=300
+        )
+        self.lbl_mode_caption.pack(pady=(0, 5))
+
+        # --- RIGHT SIDE: LIVE DISPLAY ---
+        self.frame_display = ctk.CTkFrame(
+            self, 
+            width=330, 
+            fg_color=("white", "#1E1E1E"), 
+            border_width=1, 
+            border_color=("#D3D3D3", "#333333")
+        )
+
+        ctk.CTkLabel(self.frame_display, text="LIVE MONITOR", font=("Arial", 22, "bold"), text_color=("#500000", "#FF7777")).pack(pady=(15, 20))
+
+        self.lbl_real_duty_title = ctk.CTkLabel(self.frame_display, text="Current Duty", font=("Arial", 14), text_color="gray")
+        self.lbl_real_duty_title.pack(pady=(5, 0))
+        self.lbl_real_duty = ctk.CTkLabel(self.frame_display, text="-- %", font=("Arial", 42, "bold"), text_color=("black", "white")) 
+        self.lbl_real_duty.pack(pady=(0, 20))
+
+        self.lbl_real_freq_title = ctk.CTkLabel(self.frame_display, text="Current Freq", font=("Arial", 14), text_color="gray")
+        self.lbl_real_freq_title.pack(pady=(5, 0))
+        self.lbl_real_freq = ctk.CTkLabel(self.frame_display, text="-- Hz", font=("Arial", 42, "bold"), text_color=("black", "white")) 
+        self.lbl_real_freq.pack(pady=(0, 20))
+
+        self.lbl_temp_title = ctk.CTkLabel(self.frame_display, text="FET Temperature", font=("Arial", 14), text_color="gray")
+        self.lbl_temp_title.pack(pady=(5, 0))
+        self.lbl_temp_value = ctk.CTkLabel(self.frame_display, text="-- °C", font=("Arial", 30, "bold"), text_color=("#500000", "#FF7777"))
+        self.lbl_temp_value.pack(pady=(0, 20))
+
+        self.frame_conn = ctk.CTkFrame(self.frame_display, fg_color="transparent")
+        self.frame_conn.pack(pady=10)
+        
+        self.combo_ports = ctk.CTkComboBox(self.frame_conn, values=self.get_com_ports(), button_color="#500000", button_hover_color="#3E0000")
+        self.combo_ports.pack(pady=5)
+
+        self.status_light = ctk.CTkLabel(self.frame_conn, text="", width=20, height=20, corner_radius=10, fg_color="red")
+        self.btn_connect = ctk.CTkButton(self.frame_conn, text="Connect", command=self.toggle_connection, fg_color="green")
+        
+        self.status_light.pack(side="left", padx=10)
+        self.btn_connect.pack(side="left", padx=10)
+
+        self.lbl_branding = ctk.CTkLabel(self, text="Created by the Balog Bros", font=("Arial", 10, "italic"), text_color="gray")
+        self.lbl_branding.place(relx=0.98, rely=0.98, anchor="se")
+
+    def toggle_appearance_mode(self):
+        if self.switch_theme.get() == 1:
+            ctk.set_appearance_mode("Dark")
+            self.lbl_dark.configure(text_color="white")
+            self.lbl_light.configure(text_color="gray")
+        else:
+            ctk.set_appearance_mode("Light")
+            self.lbl_dark.configure(text_color="gray")
+            self.lbl_light.configure(text_color="black")
+
+    def load_logo(self, parent_frame):
+        logo_path = os.path.join(self.base_dir, "tamu_logo.png")
+        try:
+            if os.path.exists(logo_path):
+                img = Image.open(logo_path)
+                self.logo_img = ctk.CTkImage(light_image=img, dark_image=img, size=(48, 48))
+                self.lbl_logo = ctk.CTkLabel(parent_frame, image=self.logo_img, text="")
+                self.lbl_logo.place(x=14, y=10)
+            else:
+                print(f"Notice: Logo not found at {logo_path}")
+        except Exception as e:
+            print(f"Error loading logo: {e}")
+
+    def init_log_file(self):
+        log_path = os.path.join(self.base_dir, "fet_usage_log.csv")
+        if not os.path.isfile(log_path):
+            with open(log_path, mode="w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Timestamp", "Email", "UIN"])
+
+    def attempt_login(self):
+        email = self.entry_email.get().strip().lower()
+        uin_str = self.entry_uin.get().strip()
+
+        if not email.endswith("@tamu.edu"):
+            self.lbl_error.configure(text="Access Denied: Must use a @tamu.edu email.")
+            return
+        
+        if not uin_str.isdigit() or len(uin_str) != 9:
+            self.lbl_error.configure(text="Access Denied: Invalid 9-digit UIN.")
+            return
+
+        uin_int = int(uin_str)
+
+        if self.db_connected:
+            self.btn_login.configure(text="Verifying Roster...")
+            self.update()
+            try:
+                response = self.supabase.table("roster").select("email, UIN").eq("email", email).eq("UIN", uin_int).execute()
+                
+                if not response.data:
+                    self.lbl_error.configure(text="Access Denied: Email and UIN do not match roster.")
+                    self.btn_login.configure(text="Authenticate")
+                    return
+                
+                try:
+                    self.supabase.table("user_sessions").insert({
+                        "email": email,
+                        "UIN": uin_int,
+                        "app_type": "FET Box GUI"
+                    }).execute()
+                except Exception as log_err:
+                    print(f"Non-critical: Cloud session log failure: {log_err}")
+
+            except Exception as e:
+                print(f"Database error: {e}")
+                self.lbl_error.configure(text="Database error: Check network connection.")
+                self.btn_login.configure(text="Authenticate")
+                return
+
+        log_path = os.path.join(self.base_dir, "fet_usage_log.csv")
+        with open(log_path, mode="a", newline="") as file:
+            writer = csv.writer(file)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            writer.writerow([timestamp, email, uin_str])
+
+        self.frame_login.destroy()
+        self.frame_controls.pack(side="left", fill="both", padx=20, pady=20, expand=True)
+        self.frame_display.pack(side="right", fill="both", padx=20, pady=20, expand=True)
+
+    def get_com_ports(self):
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        return ports if ports else ["No Ports Found"]
+
+    def toggle_connection(self):
+        if self.serial_connection is None and not self.reconnecting:
+            port = self.combo_ports.get()
+            if port == "No Ports Found": return
+            self.user_disconnecting = False
+            self.btn_connect.configure(text="Connecting...", fg_color="#FFA500")
+            threading.Thread(target=self._background_connect, args=(port,), daemon=True).start()
+        else:
+            # User asked to disconnect (also cancels an auto-reconnect in progress)
+            self.user_disconnecting = True
+            self.heartbeat_running = False
+            if self.link_up:
+                self.send_command("CONN", "OFF")
+                time.sleep(0.2)          # let the writer thread send CONN:OFF
+            self.link_up = False
+            try:
+                if self.serial_connection:
+                    self.serial_connection.close()
+            except Exception:
+                pass
+            self.serial_connection = None
+            self.btn_connect.configure(text="Connect", fg_color="green")
+            self.status_light.configure(fg_color="red")
+
+    def _open_and_start(self, port):
+        """Open the port and start reader/writer/heartbeat threads. Raises on failure."""
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = 115200
+        ser.timeout = 1          # read timeout
+        ser.write_timeout = 1    # never block forever on write
+        # ESP32-S3 native USB: DTR/RTS changes can reset the chip (or drop it into
+        # the bootloader). Hold both inactive BEFORE opening the port.
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+
+        self.serial_connection = ser
+        self.current_port = port
+        self.tx_queue = queue.Queue()
+        self.link_up = True
+        self.heartbeat_running = True
+        threading.Thread(target=self.read_serial_data, daemon=True).start()
+        threading.Thread(target=self._writer_loop, daemon=True).start()
+        threading.Thread(target=self.send_heartbeat_loop, daemon=True).start()
+
+        self.send_command("CONN", "ON")
+        # Only push the signal source. FET 2 mode comes from the box's panel switch;
+        # the box reports it (FET2:...) in reply to CONN:ON.
+        src = "EXT" if self.seg_source.get() == "External" else "INT"
+        self.send_command("SOURCE", src)
+
+    def _background_connect(self, port):
+        try:
+            self._open_and_start(port)
+            self.after(0, self._gui_connection_success)
+        except Exception as e:
+            print(f"Connection Error: {e}")
+            self.serial_connection = None
+            self.link_up = False
+            self.after(0, lambda: self.btn_connect.configure(text="Connect", fg_color="green"))
+
+    def _gui_connection_success(self):
+        self.btn_connect.configure(text="Disconnect", fg_color="darkred")
+        self.status_light.configure(fg_color="#00FF00")
+
+    def _link_lost(self, reason):
+        """Called from a worker thread when the port stops working."""
+        if not self.link_up:
+            return
+        self.link_up = False
+        self.heartbeat_running = False
+        print(f"Link lost: {reason}")
+        try:
+            if self.serial_connection:
+                self.serial_connection.close()
+        except Exception:
+            pass
+        self.serial_connection = None
+
+        if self.user_disconnecting or not self.current_port:
+            self.after(0, self._gui_disconnected)
+            return
+
+        # USB blipped: try to get back within the box's 3 s watchdog window.
+        self.reconnecting = True
+        self.after(0, lambda: (
+            self.btn_connect.configure(text="Reconnecting... (click to stop)", fg_color="#FFA500"),
+            self.status_light.configure(fg_color="#FFA500")))
+        threading.Thread(target=self._reconnect_loop, daemon=True).start()
+
+    def _reconnect_loop(self, give_up_after_s=15):
+        start = time.time()
+        attempt = 0
+        while not self.user_disconnecting and time.time() - start < give_up_after_s:
+            attempt += 1
+            time.sleep(0.3)
+            try:
+                self._open_and_start(self.current_port)
+                print(f"Reconnected on attempt {attempt} after {time.time() - start:.1f} s")
+                self.reconnecting = False
+                self.after(0, self._gui_connection_success)
+                return
+            except Exception:
+                pass                         # port not back yet; keep trying
+        self.reconnecting = False
+        if not self.user_disconnecting:
+            print(f"Reconnect failed after {give_up_after_s} s")
+        self.after(0, self._gui_disconnected)
+
+    def _gui_disconnected(self):
+        self.btn_connect.configure(text="Connect", fg_color="green")
+        self.status_light.configure(fg_color="red")
+
+    def _writer_loop(self):
+        """Ride out brief USB hiccups; only give up after repeated failures."""
+        MAX_CONSECUTIVE_FAILURES = 3
+        failures = 0
+        while self.link_up:
+            try:
+                line = self.tx_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            for attempt in range(2):            # one retry per line
+                try:
+                    self.serial_connection.write(line.encode("utf-8"))
+                    failures = 0
+                    break
+                except serial.SerialTimeoutException:
+                    failures += 1
+                    print(f"Write timeout ({failures}/{MAX_CONSECUTIVE_FAILURES}) on: {line.strip()}")
+                    if failures >= MAX_CONSECUTIVE_FAILURES:
+                        self._link_lost("write timed out repeatedly")
+                        return
+                except Exception as e:          # port vanished (unplugged, board reset)
+                    self._link_lost(f"write failed ({e})")
+                    return
+
+    def send_command(self, cmd_type, value):
+        """Non-blocking: queue the command for the writer thread."""
+        if not self.link_up:
+            return
+        if cmd_type == "HEARTBEAT" and self.tx_queue.qsize() > 2:
+            return                      # link is backed up; don't pile up heartbeats
+        self.tx_queue.put(f"{cmd_type}:{value}\n")
+        if cmd_type != "HEARTBEAT":
+            print(f"Sent: {cmd_type}:{value}")
+
+    def send_heartbeat_loop(self):
+        while self.heartbeat_running and self.link_up:
+            self.send_command("HEARTBEAT", "1")
+            time.sleep(0.5)
+
+    def update_duty(self):
+        val = self.entry_duty.get().strip()
+        if val.isdigit() and 0 <= int(val) <= 100:
+            self.send_command("DUTY", val)
+
+    def apply_freq_multiplier(self, multiplier):
+        val = self.entry_freq.get().strip()
+        if val.isdigit():
+            new_val = int(val) * multiplier
+            self.entry_freq.delete(0, 'end')
+            self.entry_freq.insert(0, str(new_val))
+            self.update_freq()
+
+    def update_freq(self):
+        val = self.entry_freq.get().strip()
+        if val.isdigit():
+            self.send_command("FREQ", val)
+
+    def send_config_update(self, _):
+        src = "EXT" if self.seg_source.get() == "External" else "INT"
+        self.send_command("SOURCE", src)
+        
+        gui_val = self.seg_fet2.get()
+        mode, caption = self.FET2_MODES.get(gui_val, self.FET2_MODES["Copy (q)"])
+        # send_config_update can be called from the connect thread; touch Tk on the main thread.
+        self.after(0, lambda c=caption: self.lbl_mode_caption.configure(text=c))
+        self.send_command("FET2", mode)
+
+    def read_serial_data(self):
+        while self.serial_connection and self.serial_connection.is_open:
+            try:
+                line_bytes = self.serial_connection.readline()
+                if line_bytes:
+                    line = line_bytes.decode('utf-8', errors='ignore').strip()
+                    if line: print(f"ESP32 says: {line}")
+
+                    if line.startswith("TEMP:"):
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            val_str = parts[1]
+                            if val_str == "ERR":
+                                self.after(0, lambda: self.lbl_temp_value.configure(text="ERR"))
+                            else:
+                                try:
+                                    if "|" in val_str:
+                                        c_str, f_str = val_str.split("|")
+                                        display_text = f"{float(c_str):.1f} °C  |  {float(f_str):.1f} °F"
+                                    else:
+                                        temp_c = float(val_str)
+                                        temp_f = (temp_c * 9/5) + 32
+                                        display_text = f"{temp_c:.1f} °C  |  {temp_f:.1f} °F"
+                                    self.after(0, lambda t=display_text: self.lbl_temp_value.configure(text=t))
+                                except ValueError:
+                                    pass
+
+                    elif line.startswith("DUTY:"):
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            val = parts[1]
+                            self.after(0, lambda v=val: self.lbl_real_duty.configure(text=f"{v} %"))
+
+                    elif line.startswith("FET2:"):
+                        token = line.split(":", 1)[1].strip()
+                        for label, (tok, caption) in self.FET2_MODES.items():
+                            if tok == token:
+                                # .set() updates the buttons without re-sending a command
+                                self.after(0, lambda l=label, c=caption: (
+                                    self.seg_fet2.set(l),
+                                    self.lbl_mode_caption.configure(text=c)))
+                                break
+
+                    elif line.startswith("FREQ:"):
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            val = parts[1]
+                            self.after(0, lambda v=val: self.lbl_real_freq.configure(text=f"{v} Hz"))
+            except Exception as e:
+                self._link_lost(f"read failed ({e})")
+                break
+
+if __name__ == "__main__":
+    try:
+        app = FETBoxController()
+        app.mainloop()
+    except Exception as e:
+        traceback.print_exc()
+        input("Press Enter to Exit...")
