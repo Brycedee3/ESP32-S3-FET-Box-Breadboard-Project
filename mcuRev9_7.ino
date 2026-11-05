@@ -1,0 +1,921 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>       // Library Manager: "Adafruit GFX Library"
+#include <Adafruit_ILI9341.h>   // Library Manager: "Adafruit ILI9341"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "driver/mcpwm_prelude.h"   // new MCPWM driver (Arduino-ESP32 core 3.x / IDF 5.x)
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+// --- BLE Libraries ---
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ---------------- DISPLAY (ILI9341) ----------------
+// Pins are set HERE, in the sketch. No TFT_eSPI User_Setup files are involved,
+// so the same library install works for any board: just edit these 5 lines.
+#define TFT_CS_PIN    10
+#define TFT_MOSI_PIN  11
+#define TFT_SCLK_PIN  12
+#define TFT_DC_PIN    14
+#define TFT_RST_PIN    8
+// Backlight is hard-wired on the PCB (IO20 is USB D+, never drive it).
+
+// 10 MHz: comfortably fast for this UI. Raise to 20000000 if desired;
+// drop to 4000000 if the screen ever shows garbage or stays white.
+#define TFT_SPI_HZ   10000000UL
+
+SPIClass tftSPI(FSPI);
+Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
+
+// Color names used throughout the UI (RGB565)
+#define TFT_BLACK   ILI9341_BLACK
+#define TFT_WHITE   ILI9341_WHITE
+#define TFT_RED     ILI9341_RED
+#define TFT_GREEN   ILI9341_GREEN
+#define TFT_BLUE    ILI9341_BLUE
+#define TFT_CYAN    ILI9341_CYAN
+#define TFT_ORANGE  ILI9341_ORANGE
+
+// ---------------- PINS (PCB rev pin map) ----------------
+// Strapping / reserved, never touch in firmware:
+//   IO0 BOOT, IO3, IO45, IO46 (strapping), IO35-37 (PSRAM), IO19/20 (USB D-/D+)
+//
+// TFT pins (IO8 RST, IO10 CS, IO11 MOSI, IO12 SCK, IO14 DC): see DISPLAY section above.
+
+// Encoders (GARRETT_Terminal_Block_Diagram)
+#define ENC_DUTY_A   15
+#define ENC_DUTY_B   16
+#define ENC_DUTY_SW  21
+
+#define ENC_FREQ_A    5
+#define ENC_FREQ_B    6
+#define ENC_FREQ_SW   7
+
+// FET gate-drive outputs (WALEY_FET_DRIVE)
+#define PWM_OUT_PIN   1   // PWM-A -> FET 1
+#define PWM_OUT_PIN2  2   // PWM-B -> FET 2
+
+// Heatsink temperature sensor (WALEY_PWM "HEAT"), assumed DS18B20 1-Wire data
+#define DS18B20_PIN  13
+
+// No fan pin on this PCB rev. Set to a GPIO number if one is added; -1 disables fan code.
+#define FAN_PIN      -1
+
+// Reserved for features not implemented yet (external source / D input / panel switches).
+// Configured as safe inputs (or parked LOW) so they never fight the hardware.
+#define QT_INT_OUT_PIN  17  // q(t)_internal -> BNC (master output), parked LOW for now
+#define QT_EXT_IN_PIN   18  // q(t)_external  <- BNC (slave input)
+#define D_EXT_PIN        4  // D_external analog duty input (ADC1_CH3)
+#define SW_POS_PIN       9  // SW_pos   (WALEY_PWM)
+#define SW_POS1_PIN     38  // SW_pos_1 (GARRETT)
+#define SW_POS2_PIN     39  // SW_pos_2 (GARRETT)
+
+// ---------------- FET 2 MODE SWITCH (front panel, ON-OFF-ON) ----------------
+//   Up   (ON)  -> Copy (q)              : MODE_SW_UP_PIN active
+//   Mid  (OFF) -> Alternate             : neither pin active
+//   Down (ON)  -> Complement (q') + DT  : MODE_SW_DOWN_PIN active
+// If Up/Down come out reversed on the real box, swap these two lines.
+#define MODE_SW_UP_PIN      SW_POS1_PIN   // IO38
+#define MODE_SW_DOWN_PIN    SW_POS2_PIN   // IO39
+// 1 = switch common wired to GND (uses internal pull-ups)   <- most common
+// 0 = switch common wired to 3.3 V (uses internal pull-downs)
+#define MODE_SW_ACTIVE_LOW  1
+#define MODE_SW_DEBOUNCE_MS 100   // also rides through the mid position during a fast flick
+
+// ---------------- DS18B20 ----------------
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+
+// ---------------- STATE ----------------
+int  dutyCycle = 50;         
+long frequency = 1000;       
+const float FAN_ON_TEMP = 30.0;  
+const float FAN_OFF_TEMP = 28.0; 
+
+bool extSource = false;
+bool isConnected = false;
+unsigned long lastHeartbeatTime = 0;
+// Outputs shut off if no command/heartbeat arrives for this long.
+// App sends a heartbeat every 500 ms -> 3 s tolerates ~5 missed beats.
+const unsigned long WATCHDOG_TIMEOUT_MS = 3000;
+
+enum FetMode { MODE_COPY, MODE_ALT, MODE_ALTQ };
+FetMode currentMode = MODE_COPY;
+
+float tempC = NAN;
+bool  tempOk = false;
+
+// Mode switch debounce state
+int modeSwLastRaw = -2;            // last raw reading (-1 = invalid: both contacts active)
+int modeSwStable  = -2;            // last accepted position (0 up, 1 mid, 2 down)
+unsigned long modeSwChangedAt = 0;
+
+int lastDutyA = HIGH;
+int lastFreqA = HIGH;
+unsigned long lastTempUpdate = 0;
+
+// ---------------- FREQ SWITCH STATE ----------------
+volatile bool freqFineMode = false; 
+volatile unsigned long lastFreqSwPress = 0;
+const unsigned long DEBOUNCE_DELAY_MS = 250;
+bool screenNeedsFreqModeUpdate = true; 
+
+// FREQ_MIN raised from 1 Hz: the 16-bit MCPWM counter cannot hold a 2*T
+// period (ALT PULSES) below ~20 Hz at the slowest timer clock used below.
+// The original 2003 box was spec'd at 1 kHz - 300 kHz, so this is still well
+// past the legacy range.
+const long FREQ_MIN = 20;
+const long FREQ_MAX = 500000;
+
+// ---------------- BLE GLOBALS ----------------
+BLEServer *pServer = NULL;
+BLECharacteristic * pTxCharacteristic;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+volatile bool statusLightDirty = false;   // set in BLE task, drawn in loop()
+
+// BLE writes arrive on the Bluetooth task. Everything that touches MCPWM or
+// the TFT must run on the loop() task, so BLE commands are queued here.
+struct CmdMsg { char text[64]; };
+QueueHandle_t cmdQueue = nullptr;
+
+// ---------------- FUNCTION PROTOTYPES ----------------
+// Declared explicitly so the Arduino IDE doesn't auto-generate them. Its
+// generator can misplace prototypes (e.g. around the IRAM_ATTR ISR), which
+// breaks compilation in some IDE/core versions.
+void IRAM_ATTR handleFreqSwitchPress();
+void driveOutputsLow();
+void pwmTeardown();
+esp_err_t onTimerEvent(mcpwm_gen_handle_t g, mcpwm_timer_event_t ev, mcpwm_generator_action_t act);
+esp_err_t onCompare(mcpwm_gen_handle_t g, mcpwm_cmpr_handle_t c, mcpwm_generator_action_t act);
+bool newCmpr(mcpwm_oper_handle_t op, mcpwm_cmpr_handle_t *out);
+bool newGen(mcpwm_oper_handle_t op, int pin, mcpwm_gen_handle_t *out);
+bool pwmBuild(FetMode mode, long f);
+int  altqMaxDuty();
+void pwmSetDuty(int duty);
+void applyPwm();
+void pwmSafeOff();
+void drawStatusLight();
+void drawInterface();
+void updateScreenValues();
+void updateFreqScaleIndicator();
+void initTempSensor();
+void pollTemperature();
+void updateTempOnScreen();
+void parseCommand(String cmd);
+void checkEncoders();
+bool modeSwActive(int pin);
+int  readModeSwitchRaw();
+FetMode modeFromSwitch(int pos);
+const char *modeToken(FetMode m);
+void broadcast(const String &msg);
+void setFetMode(FetMode m);
+void checkModeSwitch();
+void setup();
+void loop();
+
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// ---------------- INTERRUPT ----------------
+void IRAM_ATTR handleFreqSwitchPress() {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastFreqSwPress > DEBOUNCE_DELAY_MS) {
+        freqFineMode = !freqFineMode; 
+        lastFreqSwPress = currentMillis;
+        screenNeedsFreqModeUpdate = true; 
+    }
+}
+
+// ---------------- MCPWM ENGINE ----------------
+// One timer drives BOTH FETs in every mode. FET2 edges are generated by
+// compare events on that same counter, so there is no timer-to-timer sync,
+// no sync latency, and no percent/permille rounding. Every edge lands on an
+// exact integer tick that we compute ourselves.
+//
+//   COPY : FET1 = FET2 = high at TEZ, low at CMP
+//   ALT  : FET1 from CMP, FET2 = inverted copy through the dead-time module
+//   ALTQ : timer period = 2T (N ticks, N forced even)
+//          FET1 high at 0,     low at ON
+//          FET2 high at N/2,   low at N/2 + ON
+//          -> FET2's pulse is exactly centred in FET1's off-time.
+
+static const uint32_t MCPWM_BASE_RES_HZ = 80000000UL;  // 12.5 ns per tick
+static const uint32_t MCPWM_MIN_RES_HZ  = 312500UL;    // 80 MHz / 256
+static const uint32_t DEADTIME_NS       = 150;         // original box nominal (R12/C23)
+
+struct PwmHw {
+  mcpwm_timer_handle_t timer = nullptr;
+  mcpwm_oper_handle_t  op0   = nullptr;   // FET1 (and FET2 in COPY/ALT)
+  mcpwm_oper_handle_t  op1   = nullptr;   // FET2 in ALTQ
+  mcpwm_cmpr_handle_t  c0    = nullptr;   // FET1 falling edge
+  mcpwm_cmpr_handle_t  c1a   = nullptr;   // FET2 rising edge  (ALTQ)
+  mcpwm_cmpr_handle_t  c1b   = nullptr;   // FET2 falling edge (ALTQ)
+  mcpwm_gen_handle_t   g1    = nullptr;   // FET1 pin
+  mcpwm_gen_handle_t   g2    = nullptr;   // FET2 pin
+  uint32_t resHz     = 0;
+  uint32_t period    = 0;   // timer period in ticks (T, or 2T in ALTQ)
+  uint32_t base      = 0;   // ticks in one switching period T
+  uint32_t dtTicks   = 0;
+  long     builtFreq = -1;
+  FetMode  builtMode = MODE_COPY;
+  bool     enabled   = false;
+  bool     built     = false;
+} hw;
+
+#define MC_CHECK(x) do { esp_err_t e_ = (x); if (e_ != ESP_OK) { \
+  Serial.printf("PWM:ERR %s line %d\n", esp_err_to_name(e_), __LINE__); \
+  return false; } } while (0)
+
+void driveOutputsLow() {
+  pinMode(PWM_OUT_PIN, OUTPUT);  digitalWrite(PWM_OUT_PIN, LOW);
+  pinMode(PWM_OUT_PIN2, OUTPUT); digitalWrite(PWM_OUT_PIN2, LOW);
+}
+
+void pwmTeardown() {
+  if (hw.g1) mcpwm_generator_set_force_level(hw.g1, 0, true);
+  if (hw.g2) mcpwm_generator_set_force_level(hw.g2, 0, true);
+  if (hw.timer && hw.enabled) {
+    mcpwm_timer_start_stop(hw.timer, MCPWM_TIMER_STOP_EMPTY);
+    mcpwm_timer_disable(hw.timer);
+    hw.enabled = false;
+  }
+  if (hw.g1)  { mcpwm_del_generator(hw.g1);   hw.g1  = nullptr; }
+  if (hw.g2)  { mcpwm_del_generator(hw.g2);   hw.g2  = nullptr; }
+  if (hw.c0)  { mcpwm_del_comparator(hw.c0);  hw.c0  = nullptr; }
+  if (hw.c1a) { mcpwm_del_comparator(hw.c1a); hw.c1a = nullptr; }
+  if (hw.c1b) { mcpwm_del_comparator(hw.c1b); hw.c1b = nullptr; }
+  if (hw.op0) { mcpwm_del_operator(hw.op0);   hw.op0 = nullptr; }
+  if (hw.op1) { mcpwm_del_operator(hw.op1);   hw.op1 = nullptr; }
+  if (hw.timer) { mcpwm_del_timer(hw.timer);  hw.timer = nullptr; }
+  hw.built = false;
+  hw.builtFreq = -1;
+  driveOutputsLow();   // never leave gate-driver inputs floating
+}
+
+esp_err_t onTimerEvent(mcpwm_gen_handle_t g, mcpwm_timer_event_t ev, mcpwm_generator_action_t act) {
+  mcpwm_gen_timer_event_action_t a = {};
+  a.direction = MCPWM_TIMER_DIRECTION_UP;
+  a.event = ev;
+  a.action = act;
+  return mcpwm_generator_set_action_on_timer_event(g, a);
+}
+
+esp_err_t onCompare(mcpwm_gen_handle_t g, mcpwm_cmpr_handle_t c, mcpwm_generator_action_t act) {
+  mcpwm_gen_compare_event_action_t a = {};
+  a.direction = MCPWM_TIMER_DIRECTION_UP;
+  a.comparator = c;
+  a.action = act;
+  return mcpwm_generator_set_action_on_compare_event(g, a);
+}
+
+bool newCmpr(mcpwm_oper_handle_t op, mcpwm_cmpr_handle_t *out) {
+  mcpwm_comparator_config_t cc = {};
+  cc.flags.update_cmp_on_tez = true;   // duty changes take effect at period boundary: glitch-free
+  MC_CHECK(mcpwm_new_comparator(op, &cc, out));
+  return true;
+}
+
+bool newGen(mcpwm_oper_handle_t op, int pin, mcpwm_gen_handle_t *out) {
+  mcpwm_generator_config_t gc = {};
+  gc.gen_gpio_num = pin;
+  MC_CHECK(mcpwm_new_generator(op, &gc, out));
+  return true;
+}
+
+// Build the whole MCPWM chain for a given mode + frequency.
+bool pwmBuild(FetMode mode, long f) {
+  pwmTeardown();
+  const bool altq = (mode == MODE_ALTQ);
+
+  // Pick the fastest timer clock (80 MHz / 2^k) whose period still fits in
+  // the 16-bit counter. ALTQ needs room for 2*T.
+  const uint32_t maxBase = altq ? 32767 : 65535;
+  uint32_t res = MCPWM_BASE_RES_HZ;
+  while (res > MCPWM_MIN_RES_HZ && ((res + f / 2) / f) > maxBase) res >>= 1;
+
+  uint32_t base = (res + f / 2) / f;          // ticks per switching period T
+  if (base > maxBase) base = maxBase;
+  if (base < 4) base = 4;
+  const uint32_t period = altq ? 2 * base : base;   // always even in ALTQ
+
+  uint32_t dt = (uint32_t)(((uint64_t)DEADTIME_NS * res + 500000000ULL) / 1000000000ULL);
+  if (dt < 1) dt = 1;
+
+  mcpwm_timer_config_t tc = {};
+  tc.group_id      = 0;
+  tc.clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT;
+  tc.resolution_hz = res;
+  tc.count_mode    = MCPWM_TIMER_COUNT_MODE_UP;
+  tc.period_ticks  = period;
+  MC_CHECK(mcpwm_new_timer(&tc, &hw.timer));
+
+  mcpwm_operator_config_t oc = {};
+  oc.group_id = 0;
+  MC_CHECK(mcpwm_new_operator(&oc, &hw.op0));
+  MC_CHECK(mcpwm_operator_connect_timer(hw.op0, hw.timer));
+  if (!newCmpr(hw.op0, &hw.c0)) return false;
+  if (!newGen(hw.op0, PWM_OUT_PIN, &hw.g1)) return false;
+
+  // FET1 is identical in every mode: high at counter zero, low at c0.
+  MC_CHECK(onTimerEvent(hw.g1, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH));
+  MC_CHECK(onCompare(hw.g1, hw.c0, MCPWM_GEN_ACTION_LOW));
+
+  if (mode == MODE_COPY || mode == MODE_ALT) {
+    if (!newGen(hw.op0, PWM_OUT_PIN2, &hw.g2)) return false;
+    MC_CHECK(onTimerEvent(hw.g2, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH));
+    MC_CHECK(onCompare(hw.g2, hw.c0, MCPWM_GEN_ACTION_LOW));
+
+    if (mode == MODE_ALT) {
+      // Active-high complementary with dead time on both transitions.
+      mcpwm_dead_time_config_t d1 = {};
+      d1.posedge_delay_ticks = dt;
+      d1.negedge_delay_ticks = 0;
+      MC_CHECK(mcpwm_generator_set_dead_time(hw.g1, hw.g1, &d1));
+      mcpwm_dead_time_config_t d2 = {};
+      d2.posedge_delay_ticks = 0;
+      d2.negedge_delay_ticks = dt;
+      d2.flags.invert_output = true;
+      MC_CHECK(mcpwm_generator_set_dead_time(hw.g1, hw.g2, &d2));
+    }
+  } else {
+    // ALTQ: second operator on the SAME timer -> same counter, zero skew.
+    MC_CHECK(mcpwm_new_operator(&oc, &hw.op1));
+    MC_CHECK(mcpwm_operator_connect_timer(hw.op1, hw.timer));
+    if (!newCmpr(hw.op1, &hw.c1a)) return false;
+    if (!newCmpr(hw.op1, &hw.c1b)) return false;
+    if (!newGen(hw.op1, PWM_OUT_PIN2, &hw.g2)) return false;
+    MC_CHECK(onCompare(hw.g2, hw.c1a, MCPWM_GEN_ACTION_HIGH));
+    MC_CHECK(onCompare(hw.g2, hw.c1b, MCPWM_GEN_ACTION_LOW));
+    MC_CHECK(mcpwm_comparator_set_compare_value(hw.c1a, period / 2));
+  }
+
+  hw.resHz = res;  hw.period = period;  hw.base = base;  hw.dtTicks = dt;
+
+  // Hold outputs low until the first compare values are loaded.
+  mcpwm_generator_set_force_level(hw.g1, 0, true);
+  mcpwm_generator_set_force_level(hw.g2, 0, true);
+
+  MC_CHECK(mcpwm_timer_enable(hw.timer));
+  hw.enabled = true;
+  MC_CHECK(mcpwm_timer_start_stop(hw.timer, MCPWM_TIMER_START_NO_STOP));
+
+  hw.built = true;
+  hw.builtFreq = f;
+  hw.builtMode = mode;
+
+  Serial.printf("PWM:res=%lu Hz period=%lu ticks base=%lu dt=%lu f_actual=%.1f Hz\n",
+                (unsigned long)res, (unsigned long)period, (unsigned long)base,
+                (unsigned long)dt, (double)res / (double)base);
+  return true;
+}
+
+// Largest duty (%) allowed in ALTQ so FET1 and FET2 can never overlap and
+// keep at least one dead time between them.
+int altqMaxDuty() {
+  if (!hw.built || hw.base == 0) return 50;
+  uint32_t usable = (hw.base > hw.dtTicks) ? hw.base - hw.dtTicks : 0;
+  return (int)((usable * 100UL) / hw.base);
+}
+
+// Update duty only. Glitch-free: new compare values load at the next TEZ.
+void pwmSetDuty(int duty) {
+  if (!hw.built) return;
+
+  if (duty <= 0) {                       // 0 % = both FETs hard off in every mode
+    mcpwm_generator_set_force_level(hw.g1, 0, true);
+    mcpwm_generator_set_force_level(hw.g2, 0, true);
+    return;
+  }
+
+  if (hw.builtMode == MODE_ALTQ) {
+    uint32_t on = (uint32_t)(((uint64_t)duty * hw.base + 50) / 100);
+    uint32_t maxOn = (hw.base > hw.dtTicks) ? hw.base - hw.dtTicks : 1;
+    if (on > maxOn) on = maxOn;
+    if (on < 1) on = 1;
+    mcpwm_comparator_set_compare_value(hw.c0,  on);
+    mcpwm_comparator_set_compare_value(hw.c1b, hw.period / 2 + on);
+    mcpwm_generator_set_force_level(hw.g1, -1, true);
+    mcpwm_generator_set_force_level(hw.g2, -1, true);
+    return;
+  }
+
+  if (duty >= 100) {                     // steady on (ALT: FET2 then stays off)
+    mcpwm_generator_set_force_level(hw.g1, 1, true);
+    if (hw.builtMode == MODE_COPY) mcpwm_generator_set_force_level(hw.g2, 1, true);
+    else                           mcpwm_generator_set_force_level(hw.g2, -1, true);
+    return;
+  }
+
+  uint32_t on = (uint32_t)(((uint64_t)duty * hw.period + 50) / 100);
+  if (on < 1) on = 1;
+  if (on > hw.period - 1) on = hw.period - 1;
+  mcpwm_comparator_set_compare_value(hw.c0, on);
+  mcpwm_generator_set_force_level(hw.g1, -1, true);
+  mcpwm_generator_set_force_level(hw.g2, -1, true);
+}
+
+// Public entry point (same name as before so the rest of the sketch is unchanged).
+// Rebuilds only when mode or frequency changes; duty-only changes are a
+// single compare-register write.
+void applyPwm() {
+  long f = constrain(frequency, FREQ_MIN, FREQ_MAX);
+  frequency = f;
+
+  if (!hw.built || hw.builtFreq != f || hw.builtMode != currentMode) {
+    if (!pwmBuild(currentMode, f)) {
+      pwmTeardown();
+      return;
+    }
+  }
+
+  if (currentMode == MODE_ALTQ) {
+    int mx = altqMaxDuty();
+    if (dutyCycle > mx) dutyCycle = mx;   // echoed back to both GUIs as DUTY:
+  }
+  dutyCycle = constrain(dutyCycle, 0, 100);
+  pwmSetDuty(dutyCycle);
+}
+
+// Hard safety stop used by the heartbeat watchdog.
+void pwmSafeOff() {
+  dutyCycle = 0;
+  pwmTeardown();      // releases MCPWM and drives both pins LOW via GPIO
+}
+
+// ---------------- UI & TEMP ----------------
+void drawStatusLight() {
+  int x = 300, y = 20, radius = 8;
+  tft.fillRect(250, 10, 70, 20, TFT_BLUE);
+
+  if (isConnected) {
+    tft.fillCircle(x, y, radius, TFT_GREEN);
+    tft.setTextColor(TFT_GREEN, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setCursor(260, 15);
+    tft.print("LINK OK");
+  } else {
+    tft.fillCircle(x, y, radius, TFT_RED);
+    tft.setTextColor(TFT_RED, TFT_BLUE);
+    tft.setTextSize(1);
+    tft.setCursor(260, 15);
+    tft.print("NO LINK");
+  }
+}
+
+void drawInterface() {
+  tft.fillRect(0, 0, 320, 40, TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("FET BOX CONTROL");
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(10, 60);   tft.print("Duty:");
+  tft.setCursor(10, 100);  tft.print("Freq:");
+  tft.setCursor(10, 150);  tft.print("Src:");
+  tft.setCursor(10, 190);  tft.print("FET2:");
+  tft.setCursor(10, 230);  tft.print("Temp:");
+}
+
+void updateScreenValues() {
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+
+  tft.setCursor(80, 60);  tft.print("        ");
+  tft.setCursor(80, 60);  tft.print(dutyCycle); tft.print(" %");
+
+  tft.setCursor(80, 100); tft.print("            ");
+  tft.setCursor(80, 100); tft.print(frequency); tft.print(" Hz");
+
+  tft.setCursor(80, 150); tft.print("        ");
+  tft.setCursor(80, 150);
+  if (extSource) tft.print("EXTERNAL");
+  else           tft.print("INTERNAL");
+
+  tft.setCursor(80, 190); tft.print("                ");
+  tft.setCursor(80, 190);
+  // Legacy front-panel names (DD00003 sec. 6.2)
+  if (currentMode == MODE_ALT)        tft.print("COMPL (q')");
+  else if (currentMode == MODE_ALTQ)  tft.print("ALTERNATE");
+  else                                tft.print("COPY (q)");
+}
+
+void updateFreqScaleIndicator() {
+  if (screenNeedsFreqModeUpdate) {
+    tft.setTextSize(1);
+    tft.setCursor(80, 120); 
+    tft.print("             "); 
+    tft.setCursor(80, 120);
+    
+    if (freqFineMode) {
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.print("[FINE SCALE]");
+    } else {
+      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+      tft.print("[COARSE SCALE]");
+    }
+    screenNeedsFreqModeUpdate = false;
+  }
+}
+
+void initTempSensor() {
+  sensors.begin();
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures();
+}
+
+void pollTemperature() {
+  float t = sensors.getTempCByIndex(0);
+  if (t == DEVICE_DISCONNECTED_C) tempOk = false;
+  else { tempOk = true; tempC = t; }
+  sensors.requestTemperatures();
+}
+
+void updateTempOnScreen() {
+  tft.setTextSize(2);
+  tft.setCursor(80, 230);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.print("            ");
+  tft.setCursor(80, 230);
+
+  if (!tempOk) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("SENSOR ERR");
+  } else {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.print(tempC, 2);
+    tft.print(" C");
+  }
+}
+
+// ---------------- MODE SWITCH + MODE CHANGES ----------------
+bool modeSwActive(int pin) {
+  int v = digitalRead(pin);
+  return MODE_SW_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
+}
+
+// 0 = up, 1 = middle, 2 = down, -1 = both contacts active (wiring fault)
+int readModeSwitchRaw() {
+  bool up = modeSwActive(MODE_SW_UP_PIN);
+  bool dn = modeSwActive(MODE_SW_DOWN_PIN);
+  if (up && dn) return -1;
+  if (up)       return 0;
+  if (dn)       return 2;
+  return 1;
+}
+
+FetMode modeFromSwitch(int pos) {
+  if (pos == 0) return MODE_COPY;   // up
+  if (pos == 2) return MODE_ALT;    // down: complement with dead time
+  return MODE_ALTQ;                 // middle: alternate
+}
+
+const char *modeToken(FetMode m) {
+  if (m == MODE_ALT)  return "ALT";
+  if (m == MODE_ALTQ) return "ALTQ";
+  return "COPY";
+}
+
+// Send one status line to the USB app and, if connected, the BLE app.
+void broadcast(const String &msg) {
+  Serial.println(msg);
+  if (deviceConnected) {
+    String bleMsg = msg + "\n";
+    pTxCharacteristic->setValue(bleMsg.c_str());
+    pTxCharacteristic->notify();
+  }
+}
+
+// Single path for every mode change (panel switch or app command), so the
+// PWM, the TFT and both apps always agree.
+void setFetMode(FetMode m) {
+  currentMode = m;
+  applyPwm();
+  updateScreenValues();
+  broadcast(String("FET2:") + modeToken(currentMode));
+  broadcast("DUTY:" + String(dutyCycle));   // may have been clamped for Alternate
+}
+
+// Panel switch wins whenever it MOVES. An app can still pick a mode
+// afterwards; it holds until the switch is moved again.
+void checkModeSwitch() {
+  int raw = readModeSwitchRaw();
+  unsigned long now = millis();
+  if (raw != modeSwLastRaw) {          // reading changed: restart debounce timer
+    modeSwLastRaw = raw;
+    modeSwChangedAt = now;
+    return;
+  }
+  if (raw < 0) return;                 // both contacts active: ignore
+  if (raw != modeSwStable && now - modeSwChangedAt >= MODE_SW_DEBOUNCE_MS) {
+    modeSwStable = raw;
+    FetMode m = modeFromSwitch(raw);
+    if (m != currentMode) setFetMode(m);
+  }
+}
+
+// ---------------- COMMAND PARSER ----------------
+void parseCommand(String cmd) {
+  cmd.trim();
+  int separator = cmd.indexOf(':');
+  if (separator == -1) return;
+
+  // ANY valid command from an app proves the link is alive, not just HEARTBEAT.
+  lastHeartbeatTime = millis();
+
+  String type = cmd.substring(0, separator);
+  String val  = cmd.substring(separator + 1);
+
+  if (type == "DUTY") {
+    dutyCycle = constrain(val.toInt(), 0, 100);
+    applyPwm();
+    updateScreenValues();
+    Serial.print("DUTY:"); Serial.println(dutyCycle);
+    if (deviceConnected) {
+      String bleMsg = "DUTY:" + String(dutyCycle) + "\n";
+      pTxCharacteristic->setValue(bleMsg.c_str());
+      pTxCharacteristic->notify();
+    }
+  }
+  else if (type == "FREQ") {
+    frequency = constrain((long)val.toInt(), FREQ_MIN, FREQ_MAX);
+    applyPwm();
+    updateScreenValues();
+    Serial.print("FREQ:"); Serial.println(frequency);
+    if (deviceConnected) {
+      String bleMsg = "FREQ:" + String(frequency) + "\n";
+      pTxCharacteristic->setValue(bleMsg.c_str());
+      pTxCharacteristic->notify();
+    }
+  }
+  else if (type == "SOURCE") {
+    extSource = (val == "EXT");
+    updateScreenValues();
+  }
+  else if (type == "FET2") {
+    if (val == "ALT")       setFetMode(MODE_ALT);
+    else if (val == "ALTQ") setFetMode(MODE_ALTQ);
+    else                    setFetMode(MODE_COPY);
+  }
+  else if (type == "CONN") {
+    isConnected = (val == "ON");
+    if (isConnected) {
+      lastHeartbeatTime = millis();
+      tft.fillScreen(TFT_BLACK);
+      drawInterface();
+      drawStatusLight();
+      updateScreenValues();
+      screenNeedsFreqModeUpdate = true; 
+      updateFreqScaleIndicator();
+      updateTempOnScreen();
+      // Tell the app what the box is actually doing (mode may come from the panel switch).
+      broadcast(String("FET2:") + modeToken(currentMode));
+      broadcast("DUTY:" + String(dutyCycle));
+      broadcast("FREQ:" + String(frequency));
+    } else {
+      drawStatusLight();
+    }
+  }
+  else if (type == "HEARTBEAT") {
+    lastHeartbeatTime = millis();
+  }
+}
+
+// ---------------- BLE CALLBACKS ----------------
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      isConnected = true; 
+      lastHeartbeatTime = millis();
+      statusLightDirty = true;
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      isConnected = false;
+      statusLightDirty = true;
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue().c_str();
+      if (rxValue.length() == 0 || cmdQueue == nullptr) return;
+      // A single BLE write can carry more than one '\n'-terminated command.
+      int startIdx = 0;
+      while (startIdx < (int)rxValue.length()) {
+        int nl = rxValue.indexOf('\n', startIdx);
+        if (nl < 0) nl = rxValue.length();
+        String line = rxValue.substring(startIdx, nl);
+        line.trim();
+        if (line.length() > 0) {
+          CmdMsg m;
+          strncpy(m.text, line.c_str(), sizeof(m.text) - 1);
+          m.text[sizeof(m.text) - 1] = '\0';
+          xQueueSend(cmdQueue, &m, 0);   // never block the BLE stack
+        }
+        startIdx = nl + 1;
+      }
+    }
+};
+
+// ---------------- ENCODERS ----------------
+void checkEncoders() {
+  int dutyA = digitalRead(ENC_DUTY_A);
+  if (lastDutyA == HIGH && dutyA == LOW) {
+    int dutyB = digitalRead(ENC_DUTY_B);
+    if (dutyB == LOW) dutyCycle--;
+    else              dutyCycle++;
+    dutyCycle = constrain(dutyCycle, 0, 100);
+    applyPwm();
+    updateScreenValues();
+    Serial.print("DUTY:"); Serial.println(dutyCycle);
+    if (deviceConnected) {
+      String bleMsg = "DUTY:" + String(dutyCycle) + "\n";
+      pTxCharacteristic->setValue(bleMsg.c_str());
+      pTxCharacteristic->notify();
+    }
+    delay(1);
+  }
+  lastDutyA = dutyA;
+
+  int freqA = digitalRead(ENC_FREQ_A);
+  if (lastFreqA == HIGH && freqA == LOW) {
+    int freqB = digitalRead(ENC_FREQ_B);
+    
+    // Apply Fine or Coarse step size based on button state
+    long currentStep = freqFineMode ? 10 : 1000; 
+    
+    if (freqB == LOW) frequency -= currentStep;
+    else              frequency += currentStep;
+    
+    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
+    applyPwm();
+    updateScreenValues();
+    Serial.print("FREQ:"); Serial.println(frequency);
+    if (deviceConnected) {
+      String bleMsg = "FREQ:" + String(frequency) + "\n";
+      pTxCharacteristic->setValue(bleMsg.c_str());
+      pTxCharacteristic->notify();
+    }
+    delay(1);
+  }
+  lastFreqA = freqA;
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  // Gate-drive pins LOW before anything else so the FETs can't switch during boot.
+  driveOutputsLow();
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000) {}   // let USB enumerate so early prints aren't lost
+  Serial.println("BOOT: start");
+
+  if (FAN_PIN >= 0) {
+    pinMode(FAN_PIN, OUTPUT);
+    digitalWrite(FAN_PIN, LOW);
+  }
+
+  // Reserved pins: park in a safe state until their features exist.
+  pinMode(QT_INT_OUT_PIN, OUTPUT); digitalWrite(QT_INT_OUT_PIN, LOW);
+  pinMode(QT_EXT_IN_PIN, INPUT);
+  pinMode(D_EXT_PIN,     INPUT);
+  pinMode(SW_POS_PIN,    INPUT);
+
+  // FET 2 mode switch
+  pinMode(MODE_SW_UP_PIN,   MODE_SW_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+  pinMode(MODE_SW_DOWN_PIN, MODE_SW_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+  delay(5);                                   // let the pulls settle
+  modeSwLastRaw = modeSwStable = readModeSwitchRaw();
+  if (modeSwStable >= 0) currentMode = modeFromSwitch(modeSwStable);   // box boots in the panel's mode
+
+  pinMode(ENC_DUTY_A, INPUT_PULLUP);
+  pinMode(ENC_DUTY_B, INPUT_PULLUP);
+  pinMode(ENC_DUTY_SW, INPUT_PULLUP);
+  pinMode(ENC_FREQ_A, INPUT_PULLUP);
+  pinMode(ENC_FREQ_B, INPUT_PULLUP);
+  
+  // Initialize Push-Button Interrupt
+  pinMode(ENC_FREQ_SW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_FREQ_SW), handleFreqSwitchPress, FALLING);
+
+  lastDutyA = digitalRead(ENC_DUTY_A);
+  lastFreqA = digitalRead(ENC_FREQ_A);
+
+  cmdQueue = xQueueCreate(16, sizeof(CmdMsg));
+
+  applyPwm();
+  Serial.println("BOOT: pwm ok");
+
+  // Start the SPI bus on the PCB's display pins FIRST. The display library's
+  // own SPI begin() is then a no-op, so these pins are guaranteed.
+  tftSPI.begin(TFT_SCLK_PIN, -1, TFT_MOSI_PIN, TFT_CS_PIN);
+  tft.begin(TFT_SPI_HZ);
+  Serial.println("BOOT: tft ok");
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  drawInterface();
+  drawStatusLight();
+  updateScreenValues();
+  updateFreqScaleIndicator();
+
+  initTempSensor();
+  updateTempOnScreen();
+
+  BLEDevice::init("FET_Box_BLE");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+  BLECharacteristic * pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+  pService->start();
+  pServer->getAdvertising()->start();
+
+  lastHeartbeatTime = millis();
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  // Non-blocking line reader: drain everything that has arrived this pass.
+  // (readStringUntil() could stall loop() up to 1 s on a partial line.)
+  static String serialLine;
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      if (serialLine.length() > 0) parseCommand(serialLine);
+      serialLine = "";
+    } else if (c != '\r' && serialLine.length() < 64) {
+      serialLine += c;
+    }
+  }
+
+  // BLE commands, executed on this task (MCPWM + TFT are not thread-safe).
+  CmdMsg m;
+  while (cmdQueue && xQueueReceive(cmdQueue, &m, 0) == pdTRUE) {
+    parseCommand(String(m.text));
+  }
+
+  if (statusLightDirty) {
+    statusLightDirty = false;
+    drawStatusLight();
+  }
+
+  checkEncoders();
+  checkModeSwitch();
+  updateFreqScaleIndicator(); 
+
+  if (!deviceConnected && oldDeviceConnected) {
+      delay(500);
+      pServer->startAdvertising(); 
+      oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+      oldDeviceConnected = deviceConnected;
+  }
+
+  // Safety Heartbeat Watchdog
+  if (isConnected && (millis() - lastHeartbeatTime > WATCHDOG_TIMEOUT_MS)) {
+    pwmSafeOff();
+    isConnected = false; 
+    tft.fillScreen(TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.setTextSize(3);
+    tft.setCursor(20, 100);
+    tft.print("LINK LOST!");
+    tft.setTextSize(2);
+    tft.setCursor(40, 150);
+    tft.print("Safety Shutdown");
+  }
+
+  // Temperature Polling & Fan Hysteresis Control
+  if (millis() - lastTempUpdate > 1000) {
+    pollTemperature();
+
+    if (FAN_PIN >= 0) {
+      if (tempOk && !isnan(tempC)) {
+        if (tempC >= FAN_ON_TEMP)       digitalWrite(FAN_PIN, HIGH);
+        else if (tempC <= FAN_OFF_TEMP) digitalWrite(FAN_PIN, LOW);
+      } else {
+        digitalWrite(FAN_PIN, HIGH);    // sensor failed: fail safe, run the fan
+      }
+    }
+
+    String tempMsg = (!tempOk) ? "TEMP:ERR\n" : "TEMP:" + String(tempC, 2) + "\n";
+    Serial.print(tempMsg);
+    if (deviceConnected) {
+      pTxCharacteristic->setValue(tempMsg.c_str());
+      pTxCharacteristic->notify();
+    }
+
+    updateTempOnScreen();
+    lastTempUpdate = millis();
+  }
+}
