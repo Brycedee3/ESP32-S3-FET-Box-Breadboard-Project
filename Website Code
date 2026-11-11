@@ -144,6 +144,9 @@
         .toggle-btn.active { background-color: var(--tamu-maroon); }
         
         .mode-caption { font-size: 12px; color: gray; text-align: center; min-height: 32px; margin-bottom: 4px; }
+        .input-error { font-size: 13px; color: #D00000; font-weight: bold; min-height: 16px; margin: -4px 0 8px; text-align: center; }
+        [data-theme="dark"] .input-error { color: #FF6B6B; }
+        input.input-invalid { border-color: #D00000 !important; box-shadow: 0 0 0 2px rgba(208,0,0,0.25); }
         .clamp-note { font-size: 12px; color: var(--tamu-maroon); font-weight: bold; min-height: 16px; margin-top: -18px; margin-bottom: 10px; text-align: center; }
         [data-theme="dark"] .clamp-note { color: #FF7777; }
 
@@ -192,12 +195,14 @@
             
             <div class="control-label">Set Duty Cycle (%)</div>
             <input type="number" id="dutyInput" placeholder="e.g., 50" min="0" max="100">
+            <div class="input-error" id="dutyError"></div>
             <button id="sendDutyBtn" class="action-btn">Send Duty</button>
             
             <div class="divider">-------------------------</div>
             
             <div class="control-label">Set Frequency (Hz)</div>
             <input type="number" id="freqInput" placeholder="e.g., 5000" min="20" max="500000">
+            <div class="input-error" id="freqError"></div>
             <div class="freq-multiplier-group">
                 <button class="freq-btn" onclick="applyFreqMultiplier(1)">Hz</button>
                 <button class="freq-btn" onclick="applyFreqMultiplier(1000)">kHz</button>
@@ -211,6 +216,12 @@
             <div class="toggle-group">
                 <div id="btnSrcInt" class="toggle-btn active">Internal</div>
                 <div id="btnSrcExt" class="toggle-btn">External</div>
+            </div>
+
+            <div class="control-label">Duty Source</div>
+            <div class="toggle-group">
+                <div id="btnDsrcInt" class="toggle-btn active">Knob</div>
+                <div id="btnDsrcExt" class="toggle-btn">D BNC</div>
             </div>
             
             <div class="control-label">FET 2 Mode</div>
@@ -410,9 +421,8 @@
             showConnected();
 
             sendCommand("CONN:ON");
-            sendCommand(currentSource === "EXT" ? "SOURCE:EXT" : "SOURCE:INT");
-            // FET 2 mode is NOT pushed here: the box's panel switch sets it, and the
-            // box reports it back (FET2:...) on CONN:ON so the buttons match the hardware.
+            // Nothing else is pushed: FET 2 mode and INT/EXT source come from the box's
+            // panel switches, and the box reports both (FET2:..., SOURCE:...) on CONN:ON.
             // 500 ms heartbeat vs. 3000 ms firmware watchdog.
             clearInterval(heartbeatInterval);
             heartbeatInterval = setInterval(() => sendCommand("HEARTBEAT:1", true), 500);
@@ -542,48 +552,91 @@
         dutyInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendDutyBtn.click(); });
         freqInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendFreqBtn.click(); });
 
+        // ---------- INPUT VALIDATION (keep limits in sync with firmware FREQ_MIN / FREQ_MAX) ----------
+        const DUTY_MIN = 0, DUTY_MAX = 100;
+        const FREQ_MIN_HZ = 20, FREQ_MAX_HZ = 500000;
+        const dutyError = document.getElementById('dutyError');
+        const freqError = document.getElementById('freqError');
+
+        function fmtHz(hz) { return hz >= 1000 ? `${+(hz / 1000).toFixed(3)} kHz` : `${hz} Hz`; }
+
+        // Pure validators: return { value } or { error }
+        function parseDuty(text) {
+            const t = String(text).trim().replace(/%$/, '').trim();
+            if (t === '') return { error: 'Enter a duty cycle' };
+            const v = Number(t);
+            if (!Number.isFinite(v)) return { error: 'Invalid input: numbers only' };
+            if (!Number.isInteger(v)) return { error: 'Invalid input: whole numbers only' };
+            if (v < DUTY_MIN || v > DUTY_MAX) return { error: `Invalid input: ${v}% (allowed ${DUTY_MIN}-${DUTY_MAX}%)` };
+            return { value: v };
+        }
+        function parseFreq(text, multiplier = 1) {
+            const t = String(text).trim();
+            if (t === '') return { error: 'Enter a frequency' };
+            const v = Number(t);
+            if (!Number.isFinite(v)) return { error: 'Invalid input: numbers only' };
+            const hz = Math.round(v * multiplier);
+            if (hz < FREQ_MIN_HZ || hz > FREQ_MAX_HZ)
+                return { error: `Invalid input: ${fmtHz(hz)} (allowed ${fmtHz(FREQ_MIN_HZ)} - ${fmtHz(FREQ_MAX_HZ)})` };
+            return { value: hz };
+        }
+
+        function showInputError(input, box, msg) { box.innerText = msg; input.classList.add('input-invalid'); }
+        function clearInputError(input, box)     { box.innerText = '';  input.classList.remove('input-invalid'); }
+
+        dutyInput.addEventListener('input', () => clearInputError(dutyInput, dutyError));
+        freqInput.addEventListener('input', () => clearInputError(freqInput, freqError));
+
         sendDutyBtn.addEventListener('click', () => {
-            let val = parseInt(dutyInput.value);
-            if (!isNaN(val)) {
-                // Firmware owns the limits (incl. the Alternate-mode overlap clamp)
-                // and echoes back the value it actually applied.
-                val = Math.max(0, Math.min(100, val));
-                dutyInput.value = val;
-                lastRequestedDuty = val;
-                sendCommand("DUTY:" + val);
-            }
+            // Note: a type="number" box returns "" for non-numeric text, which shows "Enter a duty cycle".
+            const r = parseDuty(dutyInput.value);
+            if (r.error) { showInputError(dutyInput, dutyError, r.error); return; }   // nothing sent
+            clearInputError(dutyInput, dutyError);
+            // Firmware may still clamp further (Alternate-mode overlap) and echoes the applied value.
+            lastRequestedDuty = r.value;
+            sendCommand("DUTY:" + r.value);
         });
 
         window.applyFreqMultiplier = function(multiplier) {
-            let baseVal = parseFloat(freqInput.value);
-            if (!isNaN(baseVal)) {
-                let finalFreq = Math.round(baseVal * multiplier);
-                freqInput.value = finalFreq;
-                sendCommand("FREQ:" + finalFreq);
-            }
+            const r = parseFreq(freqInput.value, multiplier);
+            if (r.error) { showInputError(freqInput, freqError, r.error); return; }
+            freqInput.value = r.value;
+            clearInputError(freqInput, freqError);
+            sendCommand("FREQ:" + r.value);
         };
 
         sendFreqBtn.addEventListener('click', () => {
-            let val = parseInt(freqInput.value);
-            if (!isNaN(val)) {
-                sendCommand("FREQ:" + val);
-            }
+            const r = parseFreq(freqInput.value);
+            if (r.error) { showInputError(freqInput, freqError, r.error); return; }
+            clearInputError(freqInput, freqError);
+            sendCommand("FREQ:" + r.value);
         });
 
         // --- TOGGLE EVENT LISTENERS ---
         const btnSrcInt = document.getElementById('btnSrcInt');
         const btnSrcExt = document.getElementById('btnSrcExt');
         
-        btnSrcInt.addEventListener('click', () => {
-            btnSrcInt.classList.add('active'); btnSrcExt.classList.remove('active');
-            currentSource = "INT";
-            sendCommand("SOURCE:INT");
-        });
-        btnSrcExt.addEventListener('click', () => {
-            btnSrcExt.classList.add('active'); btnSrcInt.classList.remove('active');
-            currentSource = "EXT";
-            sendCommand("SOURCE:EXT");
-        });
+        // Update the buttons only (used when the box reports its source, e.g. panel switch moved).
+        function setSourceUI(src) {
+            if (src !== "INT" && src !== "EXT") return;
+            currentSource = src;
+            btnSrcInt.classList.toggle('active', src === "INT");
+            btnSrcExt.classList.toggle('active', src === "EXT");
+        }
+
+        btnSrcInt.addEventListener('click', () => { setSourceUI("INT"); sendCommand("SOURCE:INT"); });
+        btnSrcExt.addEventListener('click', () => { setSourceUI("EXT"); sendCommand("SOURCE:EXT"); });
+
+        // Duty source: front-panel knob or D BNC analog input
+        const btnDsrcInt = document.getElementById('btnDsrcInt');
+        const btnDsrcExt = document.getElementById('btnDsrcExt');
+        function setDsrcUI(src) {
+            if (src !== "INT" && src !== "EXT") return;
+            btnDsrcInt.classList.toggle('active', src === "INT");
+            btnDsrcExt.classList.toggle('active', src === "EXT");
+        }
+        btnDsrcInt.addEventListener('click', () => { setDsrcUI("INT"); sendCommand("DSRC:INT"); });
+        btnDsrcExt.addEventListener('click', () => { setDsrcUI("EXT"); sendCommand("DSRC:EXT"); });
 
         const btnFetCopy = document.getElementById('btnFetCopy');
         const btnFetAlt = document.getElementById('btnFetAlt');
@@ -638,6 +691,10 @@
                     } else {
                         note.innerText = "";
                     }
+                } else if (line.startsWith("DSRC:")) {
+                    setDsrcUI(line.split(":")[1].trim());
+                } else if (line.startsWith("SOURCE:")) {
+                    setSourceUI(line.split(":")[1].trim());
                 } else if (line.startsWith("FET2:")) {
                     setFetModeUI(line.split(":")[1].trim());
                 } else if (line.startsWith("FREQ:")) {
