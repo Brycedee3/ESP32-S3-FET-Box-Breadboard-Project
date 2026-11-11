@@ -6,6 +6,21 @@
 #include "driver/mcpwm_prelude.h"   // new MCPWM driver (Arduino-ESP32 core 3.x / IDF 5.x)
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "esp_system.h"           // esp_reset_reason()
+#include "esp_timer.h"            // esp_timer_get_time() for capture timeouts
+#include <math.h>
+#include "soc/gpio_reg.h"        // fast, ISR-safe GPIO reads for the encoders
+
+// ---------------- BUILD SETTINGS CHECK ----------------
+// Stop the build if the Arduino IDE settings are wrong for this PCB. (The IDE
+// resets these per sketch folder, which has caused "write timeout" / no-data bugs.)
+#if !defined(CONFIG_IDF_TARGET_ESP32S3)
+#error "Wrong board: select Tools > Board > ESP32S3 Dev Module"
+#endif
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || (ARDUINO_USB_CDC_ON_BOOT == 0)
+#error "USB CDC is off: set Tools > USB CDC On Boot > Enabled (the apps talk to the box over native USB)"
+#endif
+
 
 // --- BLE Libraries ---
 #include <BLEDevice.h>
@@ -66,9 +81,35 @@ Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
 
 // Reserved for features not implemented yet (external source / D input / panel switches).
 // Configured as safe inputs (or parked LOW) so they never fight the hardware.
-#define QT_INT_OUT_PIN  17  // q(t)_internal -> BNC (master output), parked LOW for now
+#define QT_INT_OUT_PIN  17  // q(t)_internal -> BNC (master output). Held HIGH-Z until implemented
 #define QT_EXT_IN_PIN   18  // q(t)_external  <- BNC (slave input)
 #define D_EXT_PIN        4  // D_external analog duty input (ADC1_CH3)
+
+// ---------------- BNC I/O CONFIG ----------------
+// q(t) BNC, SLAVE (ext) mode: IO18 measures the external q(t); PWM-A/B follow it.
+#define EXT_FREQ_MIN_HZ        1000     // legacy spec 1 kHz
+#define EXT_FREQ_MAX_HZ      300000     // legacy spec 300 kHz (can raise to 500000)
+#define EXT_DUTY_MIN_PCT          5
+#define EXT_DUTY_MAX_PCT         95
+#define EXT_NOISE_FLOOR_HZ      500     // anything slower is treated as "no signal"
+#define EXT_SIGNAL_TIMEOUT_MS   100     // no edges this long -> outputs off
+#define EXT_CAP_PRESCALE         16     // capture every 16th edge: low interrupt load at 300 kHz
+#define EXT_FREQ_HYST_PCT      0.3f     // only rebuild the timer if f moves more than this
+#define EXT_DUTY_HYST_PCT      0.75f
+#define EXT_UPDATE_MS            20
+#define EXT_CAP_GROUP             1     // capture uses MCPWM group 1; PWM-A/B use group 0
+
+// D BNC: analog voltage sets duty (when selected).
+#define D_V_FULL_SCALE_MV      3000     // 3.3 V zener compresses the top, so ~3.0 V = full scale
+#define D_DUTY_MIN_PCT            5
+#define D_DUTY_MAX_PCT           95
+#define D_INVERT                  0     // 1 = legacy behavior: higher voltage -> LOWER duty
+#define D_SAMPLE_MS               5
+#define D_FILTER_ALPHA        0.15f     // low-pass (EMA) on the ADC reading
+#define D_HYST_PCT            0.6f      // ignore duty wiggles smaller than this
+
+// Duty knob push button: hold this long to toggle the duty source (knob <-> D BNC).
+#define DUTY_SW_HOLD_MS        1000
 #define SW_POS_PIN       9  // SW_pos   (WALEY_PWM)
 #define SW_POS1_PIN     38  // SW_pos_1 (GARRETT)
 #define SW_POS2_PIN     39  // SW_pos_2 (GARRETT)
@@ -80,10 +121,19 @@ Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
 // If Up/Down come out reversed on the real box, swap these two lines.
 #define MODE_SW_UP_PIN      SW_POS1_PIN   // IO38
 #define MODE_SW_DOWN_PIN    SW_POS2_PIN   // IO39
-// 1 = switch common wired to GND (uses internal pull-ups)   <- most common
+// 1 = switch common wired to GND (uses internal pull-ups)
 // 0 = switch common wired to 3.3 V (uses internal pull-downs)
-#define MODE_SW_ACTIVE_LOW  1
+// PCB Rev 9: J7 pin 2 = 3.3V (COM), pin 1 = SW_pos_1 (IO38, module pad 31),
+//            pin 3 = SW_pos_2 (IO39, module pad 32)  -> active HIGH
+#define MODE_SW_ACTIVE_LOW  0
 #define MODE_SW_DEBOUNCE_MS 100   // also rides through the mid position during a fast flick
+
+// ---------------- INT/EXT SOURCE SWITCH (front panel, 2-position) ----------------
+// PCB Rev 9: P7 pin 1 = INT_EXT_D -> GPIO9, P7 pin 2 = GND. Switch closed = pin LOW.
+// Uses the internal pull-up, so an unplugged switch reads INTERNAL (safe default).
+#define SRC_SW_PIN          SW_POS_PIN    // GPIO9
+#define SRC_SW_EXT_WHEN_LOW 1             // 1: closed(LOW)=EXTERNAL. Set 0 if INT/EXT come out reversed.
+#define SRC_SW_DEBOUNCE_MS  50
 
 // ---------------- DS18B20 ----------------
 OneWire oneWire(DS18B20_PIN);
@@ -113,8 +163,67 @@ int modeSwLastRaw = -2;            // last raw reading (-1 = invalid: both conta
 int modeSwStable  = -2;            // last accepted position (0 up, 1 mid, 2 down)
 unsigned long modeSwChangedAt = 0;
 
-int lastDutyA = HIGH;
-int lastFreqA = HIGH;
+// Source switch debounce state
+int srcSwLastRaw = -1;
+int srcSwStable  = -1;            // 0 = INTERNAL, 1 = EXTERNAL
+unsigned long srcSwChangedAt = 0;
+
+// ---- BNC state ----
+bool dSourceExt  = false;      // true = duty comes from the D BNC (only with internal q(t))
+bool extNoSignal = false;      // q(t) EXT selected but no valid external signal
+bool outputsLatchedOff = false;// set by the link watchdog; cleared by a user/app action
+float dFiltMv = -1;            // filtered D voltage (mV), -1 = not started
+float dAppliedDuty = -100;     // last duty applied from D
+float extAppliedDuty = -100;   // last duty applied from external q(t)
+unsigned long lastExtReport = 0, lastDReport = 0;
+
+// Capture (q(t) EXT) handles and ISR data
+mcpwm_cap_timer_handle_t   capTimer   = nullptr;
+mcpwm_cap_channel_handle_t capChRise  = nullptr;
+mcpwm_cap_channel_handle_t capChFall  = nullptr;
+uint32_t capResHz = 0;
+bool capRunning = false;
+portMUX_TYPE capMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t capRiseTs = 0, capRisePrevTs = 0, capFallTs = 0;
+volatile uint32_t capRiseCount = 0, capFallCount = 0;
+volatile int64_t  capLastEdgeUs = 0;
+
+// ---------------- ROTARY ENCODERS ----------------
+// Full quadrature decoding in interrupts on BOTH A and B edges. Every valid
+// transition is counted (+1/-1) and impossible ones (contact bounce) count 0,
+// so bounce cancels out and no clicks are lost while the PWM is rebuilding.
+// Steps per mechanical click: 4 for most encoders (EC11 type). If each click
+// moves the value by 2, set this to 2; if it takes 2 clicks per step, set 2 too
+// and check the encoder datasheet.
+#define ENC_STEPS_PER_DETENT  4
+#define DUTY_ENC_DIR          1     // set to -1 if the duty knob turns the wrong way
+#define FREQ_ENC_DIR          1     // set to -1 if the freq knob turns the wrong way
+#define FREQ_STEP_COARSE   1000     // Hz per click
+#define FREQ_STEP_FINE       10     // Hz per click (toggle with the freq knob push)
+#define FREQ_APPLY_MS        40     // rebuild PWM at most this often while turning
+
+volatile int32_t dutyEncSteps = 0, freqEncSteps = 0;
+volatile uint8_t dutyEncState = 0, freqEncState = 0;
+int32_t dutyEncResidual = 0, freqEncResidual = 0;
+bool freqDirty = false;
+unsigned long lastFreqApply = 0;
+
+// ---- Noise rejection (no hardware filtering available on Rev 9) ----
+// Fine/coarse push button: must be held LOW continuously this long to count,
+// and released HIGH this long before another press can count.
+#define FREQ_SW_PRESS_MS          50
+#define FREQ_SW_RELEASE_MS        50
+// Ignore the push button for this long after the knob turns (turning the
+// knob often bumps the switch).
+#define FREQ_SW_TURN_LOCKOUT_MS  300
+// Partial-click steps older than this are discarded, so noise from touching
+// the knob can't slowly add up into a phantom click. 0 = filter off.
+// Frequency knob only: the duty knob has no noise problem, and the filter can
+// drop clicks when turning slowly (pausing between detents).
+#define DUTY_ENC_RESIDUAL_TIMEOUT_MS    0
+#define FREQ_ENC_RESIDUAL_TIMEOUT_MS  150
+unsigned long lastFreqTurnMs = 0;
+unsigned long dutyEncLastActivity = 0, freqEncLastActivity = 0;
 unsigned long lastTempUpdate = 0;
 
 // ---------------- FREQ SWITCH STATE ----------------
@@ -146,7 +255,11 @@ QueueHandle_t cmdQueue = nullptr;
 // Declared explicitly so the Arduino IDE doesn't auto-generate them. Its
 // generator can misplace prototypes (e.g. around the IRAM_ATTR ISR), which
 // breaks compilation in some IDE/core versions.
-void IRAM_ATTR handleFreqSwitchPress();
+void pollFreqButton();
+uint8_t IRAM_ATTR readAB(int pinA, int pinB);
+void IRAM_ATTR dutyEncISR();
+void IRAM_ATTR freqEncISR();
+int takeDetents(volatile int32_t *steps, int32_t &residual, unsigned long &lastActivity, unsigned long timeoutMs);
 void driveOutputsLow();
 void pwmTeardown();
 esp_err_t onTimerEvent(mcpwm_gen_handle_t g, mcpwm_timer_event_t ev, mcpwm_generator_action_t act);
@@ -174,6 +287,27 @@ const char *modeToken(FetMode m);
 void broadcast(const String &msg);
 void setFetMode(FetMode m);
 void checkModeSwitch();
+int  readSourceSwitchRaw();
+void setSource(bool ext);
+void checkSourceSwitch();
+float clampf(float v, float lo, float hi);
+float extFreqFromCapture(uint32_t ticksForNCycles, uint32_t nCycles, uint32_t capResHz);
+float extDutyFromEdges(uint32_t riseTs, uint32_t fallTs, float ticksPerCycle);
+float dDutyFromMillivolts(float mv);
+bool startCapture();
+void stopCapture();
+void serviceExtInput();
+void serviceDInput();
+void setDSource(bool ext);
+void pollDutyButton();
+void setQRefDuty(int duty);
+bool buildQRef(uint32_t res, uint32_t base);
+void teardownQRef();
+void reportSourceState();
+bool IRAM_ATTR onCapRise(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u);
+bool IRAM_ATTR onCapFall(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u);
+bool newCapChannel(bool rising, mcpwm_cap_channel_handle_t *out);
+const char *resetReasonText();
 void setup();
 void loop();
 
@@ -181,15 +315,26 @@ void loop();
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// ---------------- INTERRUPT ----------------
-void IRAM_ATTR handleFreqSwitchPress() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastFreqSwPress > DEBOUNCE_DELAY_MS) {
-        freqFineMode = !freqFineMode; 
-        lastFreqSwPress = currentMillis;
-        screenNeedsFreqModeUpdate = true; 
-    }
+// ---------------- INTERRUPTS ----------------
+// Quadrature lookup: index = (previous AB << 2) | current AB
+static const int8_t QDEC_TABLE[16] = { 0,-1, 1, 0,  1, 0, 0,-1,  -1, 0, 0, 1,  0, 1,-1, 0 };
+
+uint8_t IRAM_ATTR readAB(int pinA, int pinB) {
+  uint32_t in = REG_READ(GPIO_IN_REG);            // pins 5, 6, 15, 16 are all < 32
+  return (uint8_t)((((in >> pinA) & 1) << 1) | ((in >> pinB) & 1));
 }
+
+void IRAM_ATTR dutyEncISR() {
+  dutyEncState = ((dutyEncState << 2) | readAB(ENC_DUTY_A, ENC_DUTY_B)) & 0x0F;
+  __atomic_fetch_add(&dutyEncSteps, QDEC_TABLE[dutyEncState], __ATOMIC_RELAXED);
+}
+
+void IRAM_ATTR freqEncISR() {
+  freqEncState = ((freqEncState << 2) | readAB(ENC_FREQ_A, ENC_FREQ_B)) & 0x0F;
+  __atomic_fetch_add(&freqEncSteps, QDEC_TABLE[freqEncState], __ATOMIC_RELAXED);
+}
+
+// (Fine/coarse push button is now polled with strict debounce: see pollFreqButton().)
 
 // ---------------- MCPWM ENGINE ----------------
 // One timer drives BOTH FETs in every mode. FET2 edges are generated by
@@ -217,6 +362,13 @@ struct PwmHw {
   mcpwm_cmpr_handle_t  c1b   = nullptr;   // FET2 falling edge (ALTQ)
   mcpwm_gen_handle_t   g1    = nullptr;   // FET1 pin
   mcpwm_gen_handle_t   g2    = nullptr;   // FET2 pin
+  // q(t) reference output (IO17), own timer synced to the main timer
+  mcpwm_timer_handle_t timerQ = nullptr;
+  mcpwm_oper_handle_t  opQ    = nullptr;
+  mcpwm_cmpr_handle_t  cmpQ   = nullptr;
+  mcpwm_gen_handle_t   genQ   = nullptr;
+  mcpwm_sync_handle_t  syncQ  = nullptr;   // main timer TEZ -> timerQ phase reset
+  bool                 enabledQ = false;
   uint32_t resHz     = 0;
   uint32_t period    = 0;   // timer period in ticks (T, or 2T in ALTQ)
   uint32_t base      = 0;   // ticks in one switching period T
@@ -237,6 +389,7 @@ void driveOutputsLow() {
 }
 
 void pwmTeardown() {
+  teardownQRef();                      // must go first: its sync source belongs to hw.timer
   if (hw.g1) mcpwm_generator_set_force_level(hw.g1, 0, true);
   if (hw.g2) mcpwm_generator_set_force_level(hw.g2, 0, true);
   if (hw.timer && hw.enabled) {
@@ -360,6 +513,12 @@ bool pwmBuild(FetMode mode, long f) {
   mcpwm_generator_set_force_level(hw.g1, 0, true);
   mcpwm_generator_set_force_level(hw.g2, 0, true);
 
+  // q(t) reference on IO17 (master mode only). Started before the main timer so
+  // the very first main-timer TEZ aligns it.
+  if (!extSource) {
+    if (!buildQRef(res, base)) return false;
+  }
+
   MC_CHECK(mcpwm_timer_enable(hw.timer));
   hw.enabled = true;
   MC_CHECK(mcpwm_timer_start_stop(hw.timer, MCPWM_TIMER_START_NO_STOP));
@@ -385,6 +544,7 @@ int altqMaxDuty() {
 // Update duty only. Glitch-free: new compare values load at the next TEZ.
 void pwmSetDuty(int duty) {
   if (!hw.built) return;
+  setQRefDuty(duty);                   // q(t) BNC = plain base waveform, independent of FET 2 mode
 
   if (duty <= 0) {                       // 0 % = both FETs hard off in every mode
     mcpwm_generator_set_force_level(hw.g1, 0, true);
@@ -423,6 +583,11 @@ void pwmSetDuty(int duty) {
 // Rebuilds only when mode or frequency changes; duty-only changes are a
 // single compare-register write.
 void applyPwm() {
+  // q(t) EXT selected but no valid external signal: keep outputs off.
+  if (extSource && extNoSignal) {
+    if (hw.built) pwmTeardown();
+    return;
+  }
   long f = constrain(frequency, FREQ_MIN, FREQ_MAX);
   frequency = f;
 
@@ -444,7 +609,306 @@ void applyPwm() {
 // Hard safety stop used by the heartbeat watchdog.
 void pwmSafeOff() {
   dutyCycle = 0;
+  outputsLatchedOff = true;           // ext/D inputs may not restart outputs on their own
   pwmTeardown();      // releases MCPWM and drives both pins LOW via GPIO
+}
+
+// =====================================================================
+// q(t) REFERENCE OUTPUT (IO17, master/int mode)
+// Plain base waveform at the set frequency and duty, BEFORE FET 2 mode logic,
+// so the BNC output does not change when the mode switch moves. It runs on its
+// own timer (period = T) phase-reset by the main timer's TEZ, so it stays aligned
+// in all modes (the main timer runs at 2T in Alternate). Alignment is within the
+// sync latency (a few 12.5 ns ticks); fine for a reference/master output.
+// =====================================================================
+bool buildQRef(uint32_t res, uint32_t base) {
+  mcpwm_timer_config_t tc = {};
+  tc.group_id      = 0;
+  tc.clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT;
+  tc.resolution_hz = res;
+  tc.count_mode    = MCPWM_TIMER_COUNT_MODE_UP;
+  tc.period_ticks  = base;
+  MC_CHECK(mcpwm_new_timer(&tc, &hw.timerQ));
+
+  mcpwm_operator_config_t oc = {};
+  oc.group_id = 0;
+  MC_CHECK(mcpwm_new_operator(&oc, &hw.opQ));
+  MC_CHECK(mcpwm_operator_connect_timer(hw.opQ, hw.timerQ));
+  if (!newCmpr(hw.opQ, &hw.cmpQ)) return false;
+  if (!newGen(hw.opQ, QT_INT_OUT_PIN, &hw.genQ)) return false;
+  MC_CHECK(onTimerEvent(hw.genQ, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH));
+  MC_CHECK(onCompare(hw.genQ, hw.cmpQ, MCPWM_GEN_ACTION_LOW));
+
+  mcpwm_timer_sync_src_config_t sc = {};
+  sc.timer_event = MCPWM_TIMER_EVENT_EMPTY;
+  MC_CHECK(mcpwm_new_timer_sync_src(hw.timer, &sc, &hw.syncQ));
+  mcpwm_timer_sync_phase_config_t ph = {};
+  ph.sync_src    = hw.syncQ;
+  ph.count_value = 0;
+  ph.direction   = MCPWM_TIMER_DIRECTION_UP;
+  MC_CHECK(mcpwm_timer_set_phase_on_sync(hw.timerQ, &ph));
+
+  mcpwm_generator_set_force_level(hw.genQ, 0, true);   // low until duty is set
+  MC_CHECK(mcpwm_timer_enable(hw.timerQ));
+  hw.enabledQ = true;
+  MC_CHECK(mcpwm_timer_start_stop(hw.timerQ, MCPWM_TIMER_START_NO_STOP));
+  return true;
+}
+
+void teardownQRef() {
+  if (hw.genQ) mcpwm_generator_set_force_level(hw.genQ, 0, true);
+  if (hw.timerQ && hw.enabledQ) {
+    mcpwm_timer_start_stop(hw.timerQ, MCPWM_TIMER_STOP_EMPTY);
+    mcpwm_timer_disable(hw.timerQ);
+    hw.enabledQ = false;
+  }
+  if (hw.timerQ && hw.syncQ) {
+    mcpwm_timer_sync_phase_config_t ph = {};          // sync_src = NULL detaches
+    mcpwm_timer_set_phase_on_sync(hw.timerQ, &ph);
+  }
+  if (hw.genQ)  { mcpwm_del_generator(hw.genQ);   hw.genQ  = nullptr; }
+  if (hw.cmpQ)  { mcpwm_del_comparator(hw.cmpQ);  hw.cmpQ  = nullptr; }
+  if (hw.opQ)   { mcpwm_del_operator(hw.opQ);     hw.opQ   = nullptr; }
+  if (hw.timerQ){ mcpwm_del_timer(hw.timerQ);     hw.timerQ = nullptr; }
+  if (hw.syncQ) { mcpwm_del_sync_src(hw.syncQ);   hw.syncQ = nullptr; }
+  // Release IO17: high-Z, no pull. In EXT mode this is what keeps it from
+  // fighting the external generator through R17 (47 ohm).
+  pinMode(QT_INT_OUT_PIN, INPUT);
+}
+
+void setQRefDuty(int duty) {
+  if (!hw.genQ || hw.base == 0) return;
+  if (duty <= 0)   { mcpwm_generator_set_force_level(hw.genQ, 0, true); return; }
+  if (duty >= 100) { mcpwm_generator_set_force_level(hw.genQ, 1, true); return; }
+  uint32_t on = (uint32_t)(((uint64_t)duty * hw.base + 50) / 100);
+  if (on < 1) on = 1;
+  if (on > hw.base - 1) on = hw.base - 1;
+  mcpwm_comparator_set_compare_value(hw.cmpQ, on);
+  mcpwm_generator_set_force_level(hw.genQ, -1, true);
+}
+
+// =====================================================================
+// PURE MATH (no hardware access; unit-testable)
+// =====================================================================
+float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Frequency from the time of N consecutive cycles (capture prescale = N).
+float extFreqFromCapture(uint32_t ticksForNCycles, uint32_t nCycles, uint32_t capResHz) {
+  if (ticksForNCycles == 0 || nCycles == 0) return 0;
+  return (float)((double)capResHz * nCycles / ticksForNCycles);
+}
+
+// Duty (%) from ANY rising-edge timestamp and ANY later-or-earlier falling-edge
+// timestamp of the same periodic signal: high time = (fall - rise) mod period.
+// Works with prescaled captures where rise and fall come from different cycles.
+float extDutyFromEdges(uint32_t riseTs, uint32_t fallTs, float ticksPerCycle) {
+  if (ticksPerCycle <= 0) return 0;
+  // Signed difference: the latest fall may be before OR after the latest rise.
+  // (Unsigned would wrap to ~2^32, which is not a multiple of the period.)
+  // Valid while |fall - rise| < 2^31 ticks (~26 s at 80 MHz).
+  int32_t d = (int32_t)(fallTs - riseTs);
+  double high = fmod((double)d, (double)ticksPerCycle);
+  if (high < 0) high += ticksPerCycle;
+  return (float)(100.0 * high / ticksPerCycle);
+}
+
+// D BNC: linear map volts -> duty, clamped.
+float dDutyFromMillivolts(float mv) {
+  float frac = clampf(mv / (float)D_V_FULL_SCALE_MV, 0.0f, 1.0f);
+  if (D_INVERT) frac = 1.0f - frac;
+  return clampf(D_DUTY_MIN_PCT + frac * (D_DUTY_MAX_PCT - D_DUTY_MIN_PCT),
+                D_DUTY_MIN_PCT, D_DUTY_MAX_PCT);
+}
+
+// =====================================================================
+// q(t) EXTERNAL INPUT (IO18, slave/ext mode) via MCPWM capture (group 1)
+// Two capture channels on the same pin: every 16th rising edge and every 16th
+// falling edge. Period = (rise - previous rise)/16; duty from the rise/fall
+// offset modulo the period. Interrupt rate stays <= ~40 kHz even at 300 kHz.
+// PWM-A/B FOLLOW the external frequency and duty through the normal mode logic.
+// They are frequency-matched, not phase-locked (see notes).
+// =====================================================================
+bool IRAM_ATTR onCapRise(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u) {
+  portENTER_CRITICAL_ISR(&capMux);
+  capRisePrevTs = capRiseTs;
+  capRiseTs     = e->cap_value;
+  capRiseCount++;
+  capLastEdgeUs = esp_timer_get_time();
+  portEXIT_CRITICAL_ISR(&capMux);
+  return false;
+}
+
+bool IRAM_ATTR onCapFall(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u) {
+  portENTER_CRITICAL_ISR(&capMux);
+  capFallTs = e->cap_value;
+  capFallCount++;
+  portEXIT_CRITICAL_ISR(&capMux);
+  return false;
+}
+
+bool newCapChannel(bool rising, mcpwm_cap_channel_handle_t *out) {
+  mcpwm_capture_channel_config_t cc = {};
+  cc.gpio_num        = QT_EXT_IN_PIN;
+  cc.prescale        = EXT_CAP_PRESCALE;
+  cc.flags.pos_edge  = rising;
+  cc.flags.neg_edge  = !rising;
+  cc.flags.pull_down = true;   // nothing plugged in -> line held low -> no edges -> safe timeout
+  MC_CHECK(mcpwm_new_capture_channel(capTimer, &cc, out));
+  mcpwm_capture_event_callbacks_t cb = {};
+  cb.on_cap = rising ? onCapRise : onCapFall;
+  MC_CHECK(mcpwm_capture_channel_register_event_callbacks(*out, &cb, nullptr));
+  MC_CHECK(mcpwm_capture_channel_enable(*out));
+  return true;
+}
+
+bool startCapture() {
+  if (capRunning) return true;
+  portENTER_CRITICAL(&capMux);
+  capRiseTs = capRisePrevTs = capFallTs = 0;
+  capRiseCount = capFallCount = 0;
+  capLastEdgeUs = 0;
+  portEXIT_CRITICAL(&capMux);
+
+  mcpwm_capture_timer_config_t tc = {};
+  tc.group_id = EXT_CAP_GROUP;
+  tc.clk_src  = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+  MC_CHECK(mcpwm_new_capture_timer(&tc, &capTimer));
+  MC_CHECK(mcpwm_capture_timer_get_resolution(capTimer, &capResHz));
+  if (!newCapChannel(true,  &capChRise)) { stopCapture(); return false; }
+  if (!newCapChannel(false, &capChFall)) { stopCapture(); return false; }
+  MC_CHECK(mcpwm_capture_timer_enable(capTimer));
+  MC_CHECK(mcpwm_capture_timer_start(capTimer));
+  capRunning = true;
+  Serial.printf("EXT: capture on IO%d, %lu Hz timer, prescale %d\n",
+                QT_EXT_IN_PIN, (unsigned long)capResHz, EXT_CAP_PRESCALE);
+  return true;
+}
+
+void stopCapture() {
+  if (capTimer && capRunning) {
+    mcpwm_capture_timer_stop(capTimer);
+    mcpwm_capture_timer_disable(capTimer);
+  }
+  if (capChRise) { mcpwm_capture_channel_disable(capChRise); mcpwm_del_capture_channel(capChRise); capChRise = nullptr; }
+  if (capChFall) { mcpwm_capture_channel_disable(capChFall); mcpwm_del_capture_channel(capChFall); capChFall = nullptr; }
+  if (capTimer)  { mcpwm_del_capture_timer(capTimer); capTimer = nullptr; }
+  capRunning = false;
+  pinMode(QT_EXT_IN_PIN, INPUT);
+}
+
+void serviceExtInput() {
+  static unsigned long lastRun = 0;
+  if (!extSource || !capRunning) return;
+  unsigned long nowMs = millis();
+  if (nowMs - lastRun < EXT_UPDATE_MS) return;
+  lastRun = nowMs;
+
+  uint32_t rise, risePrev, fall, nRise, nFall; int64_t lastEdge;
+  portENTER_CRITICAL(&capMux);
+  rise = capRiseTs; risePrev = capRisePrevTs; fall = capFallTs;
+  nRise = capRiseCount; nFall = capFallCount; lastEdge = capLastEdgeUs;
+  portEXIT_CRITICAL(&capMux);
+
+  bool valid = (nRise >= 2 && nFall >= 1 &&
+                esp_timer_get_time() - lastEdge < (int64_t)EXT_SIGNAL_TIMEOUT_MS * 1000);
+  float f = 0, d = 0;
+  if (valid) {
+    uint32_t span = rise - risePrev;                  // ticks for EXT_CAP_PRESCALE cycles
+    f = extFreqFromCapture(span, EXT_CAP_PRESCALE, capResHz);
+    d = extDutyFromEdges(rise, fall, (float)span / EXT_CAP_PRESCALE);
+    if (f < EXT_NOISE_FLOOR_HZ) valid = false;
+  }
+
+  if (!valid) {
+    if (!extNoSignal) {
+      extNoSignal = true;
+      pwmTeardown();                                  // outputs forced low
+      extAppliedDuty = -100;
+      updateScreenValues();
+      broadcast("INFO:ext=NO_SIGNAL");
+    }
+    return;
+  }
+  if (outputsLatchedOff) return;                      // watchdog tripped: wait for user/app
+
+  float fC = clampf(f, EXT_FREQ_MIN_HZ, EXT_FREQ_MAX_HZ);
+  float dC = clampf(d, EXT_DUTY_MIN_PCT, EXT_DUTY_MAX_PCT);
+  bool wasNoSignal = extNoSignal;
+  extNoSignal = false;
+
+  bool fChange = wasNoSignal || frequency <= 0 ||
+                 fabsf(fC - (float)frequency) * 100.0f / (float)frequency > EXT_FREQ_HYST_PCT;
+  bool dChange = wasNoSignal || fabsf(dC - extAppliedDuty) >= EXT_DUTY_HYST_PCT;
+  if (!fChange && !dChange) return;
+
+  if (fChange) frequency = lroundf(fC);
+  extAppliedDuty = dC;
+  dutyCycle = lroundf(dC);
+  applyPwm();
+
+  if (wasNoSignal) broadcast("INFO:ext=LOCKED");
+  if (wasNoSignal || nowMs - lastExtReport >= 250) {
+    lastExtReport = nowMs;
+    updateScreenValues();
+    broadcast("FREQ:" + String(frequency));
+    broadcast("DUTY:" + String(dutyCycle));
+  }
+}
+
+// =====================================================================
+// D BNC ANALOG DUTY (IO4, ADC1_CH3) - used only with INTERNAL q(t) and D selected
+// =====================================================================
+void serviceDInput() {
+  static unsigned long lastRun = 0;
+  if (!dSourceExt || extSource || outputsLatchedOff) return;
+  unsigned long nowMs = millis();
+  if (nowMs - lastRun < D_SAMPLE_MS) return;
+  lastRun = nowMs;
+
+  float mv = (float)analogReadMilliVolts(D_EXT_PIN);  // calibrated (eFuse/curve fitting) mV
+  dFiltMv = (dFiltMv < 0) ? mv : dFiltMv + D_FILTER_ALPHA * (mv - dFiltMv);
+  float target = dDutyFromMillivolts(dFiltMv);
+  if (fabsf(target - dAppliedDuty) < D_HYST_PCT) return;
+  dAppliedDuty = target;
+
+  int newDuty = lroundf(target);
+  if (newDuty == dutyCycle) return;
+  dutyCycle = newDuty;
+  applyPwm();                                          // compare update on TEZ: glitch-free
+  if (nowMs - lastDReport >= 250) {
+    lastDReport = nowMs;
+    updateScreenValues();
+    broadcast("DUTY:" + String(dutyCycle));
+  }
+}
+
+void setDSource(bool ext) {
+  dSourceExt = ext;
+  dFiltMv = -1;
+  dAppliedDuty = -100;
+  outputsLatchedOff = false;
+  updateScreenValues();
+  broadcast(ext ? "DSRC:EXT" : "DSRC:INT");
+  if (ext && extSource) broadcast("INFO:d_ignored=q(t) is EXTERNAL; duty comes from the external q(t)");
+}
+
+// Duty knob push button: hold DUTY_SW_HOLD_MS to toggle the duty source.
+void pollDutyButton() {
+  static bool lastRaw = false, held = false;
+  static unsigned long changedAt = 0;
+  bool raw = (digitalRead(ENC_DUTY_SW) == LOW);
+  unsigned long now = millis();
+  if (raw != lastRaw) { lastRaw = raw; changedAt = now; if (!raw) held = false; return; }
+  if (raw && !held && now - changedAt >= DUTY_SW_HOLD_MS) {
+    held = true;                                       // once per press
+    setDSource(!dSourceExt);
+  }
+}
+
+void reportSourceState() {
+  broadcast(extSource ? "SOURCE:EXT" : "SOURCE:INT");
+  broadcast(dSourceExt ? "DSRC:EXT" : "DSRC:INT");
+  if (extSource) broadcast(extNoSignal ? "INFO:ext=NO_SIGNAL" : "INFO:ext=LOCKED");
 }
 
 // ---------------- UI & TEMP ----------------
@@ -493,10 +957,11 @@ void updateScreenValues() {
   tft.setCursor(80, 100); tft.print("            ");
   tft.setCursor(80, 100); tft.print(frequency); tft.print(" Hz");
 
-  tft.setCursor(80, 150); tft.print("        ");
+  tft.setCursor(80, 150); tft.print("              ");
   tft.setCursor(80, 150);
-  if (extSource) tft.print("EXTERNAL");
-  else           tft.print("INTERNAL");
+  if (extSource)       tft.print(extNoSignal ? "EXT: NO SIG" : "EXTERNAL");
+  else if (dSourceExt) tft.print("INT, D=BNC");
+  else                 tft.print("INTERNAL");
 
   tft.setCursor(80, 190); tft.print("                ");
   tft.setCursor(80, 190);
@@ -620,6 +1085,69 @@ void checkModeSwitch() {
   }
 }
 
+// ---------------- SOURCE SWITCH ----------------
+// 1 = EXTERNAL, 0 = INTERNAL
+int readSourceSwitchRaw() {
+  bool low = (digitalRead(SRC_SW_PIN) == LOW);
+  return (low == (SRC_SW_EXT_WHEN_LOW == 1)) ? 1 : 0;
+}
+
+// Single path for every source change (panel switch or app), so the screen
+// and both apps always agree. NOTE: the external q(t) input itself is not
+// implemented yet; this only records and reports the selection.
+void setSource(bool ext) {
+  // Any int/ext change: force PWM-A/B low, reconfigure IO17/IO18 and the timer
+  // source, then release.
+  pwmTeardown();                       // outputs low, IO17 released to high-Z
+  extSource = ext;
+  outputsLatchedOff = false;
+  if (ext) {
+    extNoSignal = true;                // stay off until a valid external q(t) is measured
+    extAppliedDuty = -100;
+    if (!startCapture()) broadcast("INFO:ext=CAPTURE_ERROR");
+  } else {
+    stopCapture();
+    extNoSignal = false;
+    applyPwm();                        // rebuild with the q(t) reference on IO17
+  }
+  updateScreenValues();
+  broadcast(ext ? "SOURCE:EXT" : "SOURCE:INT");
+  if (ext) broadcast("INFO:ext=WAITING_FOR_SIGNAL");
+}
+
+// Same rule as the mode switch: the panel wins whenever it MOVES; an app can
+// change it afterwards until the switch is moved again.
+void checkSourceSwitch() {
+  int raw = readSourceSwitchRaw();
+  unsigned long now = millis();
+  if (raw != srcSwLastRaw) {
+    srcSwLastRaw = raw;
+    srcSwChangedAt = now;
+    return;
+  }
+  if (raw != srcSwStable && now - srcSwChangedAt >= SRC_SW_DEBOUNCE_MS) {
+    srcSwStable = raw;
+    if ((raw == 1) != extSource) setSource(raw == 1);
+  }
+}
+
+// Why the chip last restarted. Reported at boot and on every app connect,
+// so an unexpected reboot shows up in the app's terminal.
+const char *resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "POWER_ON";
+    case ESP_RST_EXT:      return "EXTERNAL_PIN";
+    case ESP_RST_SW:       return "SOFTWARE";
+    case ESP_RST_PANIC:    return "CRASH_PANIC";
+    case ESP_RST_INT_WDT:  return "INTERRUPT_WATCHDOG";
+    case ESP_RST_TASK_WDT: return "TASK_WATCHDOG";
+    case ESP_RST_WDT:      return "OTHER_WATCHDOG";
+    case ESP_RST_BROWNOUT: return "BROWNOUT_POWER_DIP";
+    case ESP_RST_USB:      return "USB";
+    default:               return "OTHER";
+  }
+}
+
 // ---------------- COMMAND PARSER ----------------
 void parseCommand(String cmd) {
   cmd.trim();
@@ -631,6 +1159,24 @@ void parseCommand(String cmd) {
 
   String type = cmd.substring(0, separator);
   String val  = cmd.substring(separator + 1);
+
+  if ((type == "DUTY" || type == "FREQ") && extSource) {
+    broadcast("INFO:ignored=q(t) is EXTERNAL; freq and duty follow the external signal");
+    broadcast("FREQ:" + String(frequency));
+    broadcast("DUTY:" + String(dutyCycle));
+    return;
+  }
+  if (type == "DUTY" && dSourceExt) {
+    broadcast("INFO:ignored=duty source is the D BNC");
+    broadcast("DUTY:" + String(dutyCycle));
+    return;
+  }
+  if (type == "DUTY" || type == "FREQ") outputsLatchedOff = false;
+
+  if (type == "DSRC") {
+    setDSource(val == "EXT");
+    return;
+  }
 
   if (type == "DUTY") {
     dutyCycle = constrain(val.toInt(), 0, 100);
@@ -655,8 +1201,7 @@ void parseCommand(String cmd) {
     }
   }
   else if (type == "SOURCE") {
-    extSource = (val == "EXT");
-    updateScreenValues();
+    setSource(val == "EXT");
   }
   else if (type == "FET2") {
     if (val == "ALT")       setFetMode(MODE_ALT);
@@ -676,8 +1221,11 @@ void parseCommand(String cmd) {
       updateTempOnScreen();
       // Tell the app what the box is actually doing (mode may come from the panel switch).
       broadcast(String("FET2:") + modeToken(currentMode));
+      reportSourceState();
       broadcast("DUTY:" + String(dutyCycle));
       broadcast("FREQ:" + String(frequency));
+      broadcast(String("INFO:last_reset=") + resetReasonText() +
+                " uptime_s=" + String(millis() / 1000));
     } else {
       drawStatusLight();
     }
@@ -725,47 +1273,80 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 };
 
 // ---------------- ENCODERS ----------------
-void checkEncoders() {
-  int dutyA = digitalRead(ENC_DUTY_A);
-  if (lastDutyA == HIGH && dutyA == LOW) {
-    int dutyB = digitalRead(ENC_DUTY_B);
-    if (dutyB == LOW) dutyCycle--;
-    else              dutyCycle++;
-    dutyCycle = constrain(dutyCycle, 0, 100);
-    applyPwm();
-    updateScreenValues();
-    Serial.print("DUTY:"); Serial.println(dutyCycle);
-    if (deviceConnected) {
-      String bleMsg = "DUTY:" + String(dutyCycle) + "\n";
-      pTxCharacteristic->setValue(bleMsg.c_str());
-      pTxCharacteristic->notify();
-    }
-    delay(1);
+// Convert accumulated quadrature steps into whole clicks, keeping the remainder.
+int takeDetents(volatile int32_t *steps, int32_t &residual, unsigned long &lastActivity, unsigned long timeoutMs) {
+  int32_t s = __atomic_exchange_n(steps, 0, __ATOMIC_RELAXED);
+  unsigned long now = millis();
+  if (s != 0) {
+    lastActivity = now;
+  } else if (timeoutMs > 0 && residual != 0 && now - lastActivity > timeoutMs) {
+    residual = 0;                      // stale partial click (likely noise): drop it
   }
-  lastDutyA = dutyA;
+  residual += s;
+  int d = residual / ENC_STEPS_PER_DETENT;
+  residual -= d * ENC_STEPS_PER_DETENT;
+  return d;
+}
 
-  int freqA = digitalRead(ENC_FREQ_A);
-  if (lastFreqA == HIGH && freqA == LOW) {
-    int freqB = digitalRead(ENC_FREQ_B);
-    
-    // Apply Fine or Coarse step size based on button state
-    long currentStep = freqFineMode ? 10 : 1000; 
-    
-    if (freqB == LOW) frequency -= currentStep;
-    else              frequency += currentStep;
-    
-    frequency = constrain(frequency, FREQ_MIN, FREQ_MAX);
+void checkEncoders() {
+  // Duty: cheap (one compare-register write), apply immediately.
+  int dd = takeDetents(&dutyEncSteps, dutyEncResidual, dutyEncLastActivity, DUTY_ENC_RESIDUAL_TIMEOUT_MS);
+  if (dd != 0 && (extSource || dSourceExt)) dd = 0;   // duty comes from a BNC: knob ignored
+  if (dd != 0) {
+    outputsLatchedOff = false;
+    dutyCycle = constrain(dutyCycle + dd * DUTY_ENC_DIR, 0, 100);
     applyPwm();
     updateScreenValues();
-    Serial.print("FREQ:"); Serial.println(frequency);
-    if (deviceConnected) {
-      String bleMsg = "FREQ:" + String(frequency) + "\n";
-      pTxCharacteristic->setValue(bleMsg.c_str());
-      pTxCharacteristic->notify();
-    }
-    delay(1);
+    broadcast("DUTY:" + String(dutyCycle));
   }
-  lastFreqA = freqA;
+
+  // Frequency: accumulate clicks; rebuild the PWM at most every FREQ_APPLY_MS.
+  int fd = takeDetents(&freqEncSteps, freqEncResidual, freqEncLastActivity, FREQ_ENC_RESIDUAL_TIMEOUT_MS);
+  if (fd != 0 && extSource) fd = 0;                  // freq follows the external q(t)
+  if (fd != 0) {
+    outputsLatchedOff = false;
+    lastFreqTurnMs = millis();
+    long step = freqFineMode ? FREQ_STEP_FINE : FREQ_STEP_COARSE;
+    frequency = constrain(frequency + (long)fd * step * FREQ_ENC_DIR, FREQ_MIN, FREQ_MAX);
+    freqDirty = true;
+  }
+  if (freqDirty && millis() - lastFreqApply >= FREQ_APPLY_MS) {
+    freqDirty = false;
+    lastFreqApply = millis();
+    applyPwm();
+    updateScreenValues();
+    broadcast("FREQ:" + String(frequency));
+  }
+}
+
+// Fine/coarse toggle on the frequency knob's push switch.
+// A press counts only if the pin stays LOW for FREQ_SW_PRESS_MS without a single
+// bounce, and only once per press (must release for FREQ_SW_RELEASE_MS first).
+// Noise from touching the knob produces short spikes and never qualifies.
+void pollFreqButton() {
+  static bool lastRaw = false;      // true = LOW (pressed)
+  static bool pressed = false;      // debounced state
+  static unsigned long changedAt = 0;
+
+  bool raw = (digitalRead(ENC_FREQ_SW) == LOW);
+  unsigned long now = millis();
+  if (raw != lastRaw) {             // any change restarts the stability timer
+    lastRaw = raw;
+    changedAt = now;
+    return;
+  }
+  unsigned long stableFor = now - changedAt;
+
+  if (raw && !pressed && stableFor >= FREQ_SW_PRESS_MS) {
+    pressed = true;
+    if (now - lastFreqTurnMs >= FREQ_SW_TURN_LOCKOUT_MS) {
+      freqFineMode = !freqFineMode;
+      screenNeedsFreqModeUpdate = true;
+      broadcast(freqFineMode ? "INFO:freq_step=FINE" : "INFO:freq_step=COARSE");
+    }
+  } else if (!raw && pressed && stableFor >= FREQ_SW_RELEASE_MS) {
+    pressed = false;
+  }
 }
 
 // ---------------- SETUP ----------------
@@ -776,6 +1357,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}   // let USB enumerate so early prints aren't lost
   Serial.println("BOOT: start");
+  Serial.printf("BOOT: reset reason=%s\n", resetReasonText());
 
   if (FAN_PIN >= 0) {
     pinMode(FAN_PIN, OUTPUT);
@@ -783,10 +1365,19 @@ void setup() {
   }
 
   // Reserved pins: park in a safe state until their features exist.
-  pinMode(QT_INT_OUT_PIN, OUTPUT); digitalWrite(QT_INT_OUT_PIN, LOW);
+  // IO17 shares the q(t) BNC with IO18 through only R17 = 47 ohm. Driving it would
+  // fight any external generator plugged into that BNC, so keep it high-Z (input,
+  // no pull) until the q(t) output feature is implemented.
+  pinMode(QT_INT_OUT_PIN, INPUT);
   pinMode(QT_EXT_IN_PIN, INPUT);
-  pinMode(D_EXT_PIN,     INPUT);
-  pinMode(SW_POS_PIN,    INPUT);
+  // D BNC: ADC1_CH3, 11/12 dB attenuation (0 - ~3.1 V), 12-bit; calibrated via analogReadMilliVolts()
+  analogReadResolution(12);
+  analogSetPinAttenuation(D_EXT_PIN, ADC_11db);
+  // INT/EXT source switch (closes to GND)
+  pinMode(SRC_SW_PIN, INPUT_PULLUP);
+  delay(5);
+  srcSwLastRaw = srcSwStable = readSourceSwitchRaw();
+  extSource = (srcSwStable == 1);                 // box boots with the panel's source
 
   // FET 2 mode switch
   pinMode(MODE_SW_UP_PIN,   MODE_SW_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
@@ -803,14 +1394,26 @@ void setup() {
   
   // Initialize Push-Button Interrupt
   pinMode(ENC_FREQ_SW, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENC_FREQ_SW), handleFreqSwitchPress, FALLING);
+  // Fine/coarse button is polled (pollFreqButton), not interrupt-driven: an edge
+  // interrupt fired on every noise spike from touching the knob.
 
-  lastDutyA = digitalRead(ENC_DUTY_A);
-  lastFreqA = digitalRead(ENC_FREQ_A);
+  // Encoders: seed the decoder state, then interrupt on every edge of A and B.
+  dutyEncState = readAB(ENC_DUTY_A, ENC_DUTY_B);
+  freqEncState = readAB(ENC_FREQ_A, ENC_FREQ_B);
+  attachInterrupt(digitalPinToInterrupt(ENC_DUTY_A), dutyEncISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DUTY_B), dutyEncISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_FREQ_A), freqEncISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_FREQ_B), freqEncISR, CHANGE);
 
   cmdQueue = xQueueCreate(16, sizeof(CmdMsg));
 
-  applyPwm();
+  // Outputs stay low and IO17 high-Z until the int/ext switch is resolved (read above).
+  if (extSource) {
+    extNoSignal = true;
+    if (!startCapture()) Serial.println("EXT: capture start failed");
+  } else {
+    applyPwm();
+  }
   Serial.println("BOOT: pwm ok");
 
   // Start the SPI bus on the PCB's display pins FIRST. The display library's
@@ -869,7 +1472,12 @@ void loop() {
   }
 
   checkEncoders();
+  pollFreqButton();
   checkModeSwitch();
+  checkSourceSwitch();
+  pollDutyButton();
+  serviceExtInput();
+  serviceDInput();
   updateFreqScaleIndicator(); 
 
   if (!deviceConnected && oldDeviceConnected) {
