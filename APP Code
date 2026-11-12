@@ -75,6 +75,7 @@ class FETBoxController(ctk.CTk):
         # enqueue, so a stalled USB link can never freeze the GUI.
         self.tx_queue = queue.Queue()
         self.link_up = False
+        self.thermal_locked = False      # True while the box reports over temperature
         self.current_port = None         # remembered for auto-reconnect
         self.user_disconnecting = False  # True only when the user clicks Disconnect
         self.reconnecting = False
@@ -333,7 +334,13 @@ class FETBoxController(ctk.CTk):
         self.lbl_temp_title = ctk.CTkLabel(self.frame_display, text="FET Temperature", font=("Arial", 14), text_color="gray")
         self.lbl_temp_title.pack(pady=(5, 0))
         self.lbl_temp_value = ctk.CTkLabel(self.frame_display, text="-- °C", font=("Arial", 30, "bold"), text_color=("#500000", "#FF7777"))
-        self.lbl_temp_value.pack(pady=(0, 20))
+        self.lbl_temp_value.pack(pady=(0, 10))
+
+        # Over-temperature alert (hidden until the box reports THERMAL:TRIP)
+        self.lbl_thermal = ctk.CTkLabel(
+            self.frame_display, text="", font=("Arial", 14, "bold"),
+            text_color="white", fg_color="transparent", corner_radius=8, wraplength=300)
+        self.lbl_thermal.pack(pady=(0, 10), ipadx=8, ipady=6)
 
         self.frame_conn = ctk.CTkFrame(self.frame_display, fg_color="transparent")
         self.frame_conn.pack(pady=10)
@@ -577,6 +584,29 @@ class FETBoxController(ctk.CTk):
     def _gui_disconnected(self):
         self.btn_connect.configure(text="Connect", fg_color="green")
         self.status_light.configure(fg_color="red")
+        self._set_thermal_lock(False)    # no live data; the box re-reports on reconnect
+
+    # ---------- over-temperature: read-only mode ----------
+    def _control_widgets(self):
+        return [self.entry_duty, self.btn_duty, self.entry_freq, self.btn_freq_hz,
+                self.btn_freq_k, self.btn_freq_100k, self.btn_freq,
+                self.seg_source, self.seg_dsrc, self.seg_fet2]
+
+    def _set_thermal_lock(self, locked):
+        """Show/hide the alert and disable/enable every control. Live data keeps updating."""
+        self.thermal_locked = locked
+        state = "disabled" if locked else "normal"
+        for w in self._control_widgets():
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+        if locked:
+            self.lbl_thermal.configure(
+                text="⚠ OVER TEMPERATURE\nOutputs off while the box cools.\nControls locked until below 59 °C.",
+                fg_color="#B00000")
+        else:
+            self.lbl_thermal.configure(text="", fg_color="transparent")
 
     def _writer_loop(self):
         """Ride out brief USB hiccups; only give up after repeated failures."""
@@ -605,6 +635,9 @@ class FETBoxController(ctk.CTk):
     def send_command(self, cmd_type, value):
         """Non-blocking: queue the command for the writer thread."""
         if not self.link_up:
+            return
+        if self.thermal_locked and cmd_type not in ("CONN", "HEARTBEAT"):
+            print(f"Blocked {cmd_type}:{value} (box over temperature, read-only)")
             return
         if cmd_type == "HEARTBEAT" and self.tx_queue.qsize() > 2:
             return                      # link is backed up; don't pile up heartbeats
@@ -677,7 +710,11 @@ class FETBoxController(ctk.CTk):
                     line = line_bytes.decode('utf-8', errors='ignore').strip()
                     if line: print(f"ESP32 says: {line}")
 
-                    if line.startswith("TEMP:"):
+                    if line.startswith("THERMAL:"):
+                        locked = line.split(":", 1)[1].strip() == "TRIP"
+                        self.after(0, lambda l=locked: self._set_thermal_lock(l))
+
+                    elif line.startswith("TEMP:"):
                         parts = line.split(":")
                         if len(parts) >= 2:
                             val_str = parts[1]
