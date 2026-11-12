@@ -7,9 +7,9 @@ panel, a desktop app over USB, or a web app over Bluetooth.
 
 | Component | File | Talks to the box over |
 |---|---|---|
-| Firmware | `MCU Code` (`mcuRev10_2.ino`) | — |
-| Desktop app | `APP Code` (`guiRev10_1.py`) | USB serial |
-| Web app | `Website Code` (`FET_GUI_Rev10_1.html`) | Bluetooth Low Energy |
+| Firmware | `MCU Code` (`mcuRev10_7.ino`) | — |
+| Desktop app | `APP Code` (`guiRev10_2.py`) | USB serial |
+| Web app | `Website Code` (`FET_GUI_Rev10_3.html`) | Bluetooth Low Energy |
 
 ---
 
@@ -31,6 +31,7 @@ panel, a desktop app over USB, or a web app over Bluetooth.
 - **Safety watchdog:** if the controlling app goes silent for 3 s, the outputs shut off
   and the screen shows **LINK LOST**.
 - **Temperature:** DS18B20 heatsink probe, shown on the box and in both apps.
+- **Over-temperature protection:** above 60 °C (3 consecutive readings) the FET and q(t) outputs turn off, the LCD shows an OVER TEMP alert, and the apps become read-only. Everything resumes automatically below 59 °C.
 - **Student login:** email + UIN checked against a Supabase roster, with each session logged.
 
 ---
@@ -63,7 +64,7 @@ panel, a desktop app over USB, or a web app over Bluetooth.
 | Flash Size / PSRAM | Match your module (e.g. N16R8 → 16 MB / OPI PSRAM) |
 
 ### Flashing
-1. Put `mcuRev10_2.ino` in a folder named `mcuRev10_2` (the IDE requires the names to match).
+1. Put `mcuRev10_7.ino` in a folder named `mcuRev10_7` (the IDE requires the names to match).
    Keep only **one** `.ino` file in that folder.
 2. Close the Serial Monitor and any app that is using the COM port.
 3. If the upload can't connect: unplug USB, **hold BOOT while plugging it back in**, release.
@@ -109,7 +110,7 @@ python -m pip install customtkinter pyserial Pillow supabase
 
 ### Run
 ```bash
-python guiRev10_1.py
+python guiRev10_2.py
 ```
 1. Log in with your email and UIN.
 2. Select the box's COM port (the same one the Arduino IDE shows under Tools → Port) and click **Connect**.
@@ -134,7 +135,7 @@ No install needed, but Web Bluetooth has requirements:
   ```bash
   python -m http.server 8000
   ```
-  then open <http://localhost:8000/FET_GUI_Rev10_1.html>.
+  then open <http://localhost:8000/FET_GUI_Rev10_3.html>.
 - Bluetooth must be turned on in the operating system.
 
 Click **Connect**, choose **FET_Box_BLE**, and log in.
@@ -177,6 +178,7 @@ Commands are plain text lines ending in `\n`, identical over USB and BLE.
 | `FREQ:<n>` | Frequency applied |
 | `FET2:<mode>` | Current mode (sent on connect and when the panel switch moves) |
 | `TEMP:<°C>` / `TEMP:ERR` | Heatsink temperature, once per second |
+| `THERMAL:TRIP` / `THERMAL:OK` | Over-temperature shutdown active / cleared (apps lock / unlock controls) |
 | `SOURCE:<INT/EXT>` / `DSRC:<INT/EXT>` | Current q(t) source and duty source |
 | `INFO:ext=WAITING_FOR_SIGNAL / LOCKED / NO_SIGNAL` | External q(t) status |
 
