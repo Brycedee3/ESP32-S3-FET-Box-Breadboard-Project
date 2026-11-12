@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "esp_system.h"           // esp_reset_reason()
+#include "driver/rtc_io.h"         // pull-down on the D BNC input (IO4 is an RTC/analog pin)
 #include "esp_timer.h"            // esp_timer_get_time() for capture timeouts
 #include <math.h>
 #include "soc/gpio_reg.h"        // fast, ISR-safe GPIO reads for the encoders
@@ -40,6 +41,13 @@
 
 // 10 MHz: comfortably fast for this UI. Raise to 20000000 if desired;
 // drop to 4000000 if the screen ever shows garbage or stays white.
+// Temperature readout position (bottom-right, same row as FET2)
+#define TEMP_VALUE_Y        190
+#define TEMP_VALUE_X0       230      // left edge of the cleared area (7 chars = 84 px)
+#define TEMP_RIGHT_EDGE_X   314      // text is right-aligned to this x
+#define TEMP_LABEL_X        292      // "TEMP" label (size 1) above the value
+#define TEMP_LABEL_Y        178
+
 #define TFT_SPI_HZ   10000000UL
 
 SPIClass tftSPI(FSPI);
@@ -53,6 +61,7 @@ Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
 #define TFT_BLUE    ILI9341_BLUE
 #define TFT_CYAN    ILI9341_CYAN
 #define TFT_ORANGE  ILI9341_ORANGE
+#define TFT_YELLOW  ILI9341_YELLOW
 
 // ---------------- PINS (PCB rev pin map) ----------------
 // Strapping / reserved, never touch in firmware:
@@ -100,13 +109,23 @@ Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
 #define EXT_CAP_GROUP             1     // capture uses MCPWM group 1; PWM-A/B use group 0
 
 // D BNC: analog voltage sets duty (when selected).
-#define D_V_FULL_SCALE_MV      3000     // 3.3 V zener compresses the top, so ~3.0 V = full scale
+#define D_V_MIN_MV              200     // at or below this voltage -> D_DUTY_MIN_PCT (5%)
+#define D_V_FULL_SCALE_MV      3000     // at or above this voltage -> D_DUTY_MAX_PCT (95%); 3.3 V zener compresses the top
 #define D_DUTY_MIN_PCT            5
 #define D_DUTY_MAX_PCT           95
 #define D_INVERT                  0     // 1 = legacy behavior: higher voltage -> LOWER duty
 #define D_SAMPLE_MS               5
 #define D_FILTER_ALPHA        0.15f     // low-pass (EMA) on the ADC reading
 #define D_HYST_PCT            0.6f      // ignore duty wiggles smaller than this
+
+// ---------------- OVER-TEMPERATURE PROTECTION ----------------
+// Above OT_TRIP_C the FET outputs (and the q(t) BNC output) are forced off and all
+// controls are locked; the screen, sensor and app links stay on. Outputs resume
+// automatically once the heatsink cools below OT_CLEAR_C.
+#define OT_TRIP_C          60.0f    // trip when temperature is ABOVE this
+#define OT_CLEAR_C         59.0f    // resume when temperature is BELOW this
+#define OT_CONFIRM_READS      3     // consecutive 1 s readings needed (rejects one-off glitches,
+                                    // incl. the DS18B20's 85.0 C power-on value)
 
 // Duty knob push button: hold this long to toggle the duty source (knob <-> D BNC).
 #define DUTY_SW_HOLD_MS        1000
@@ -176,6 +195,10 @@ float dFiltMv = -1;            // filtered D voltage (mV), -1 = not started
 float dAppliedDuty = -100;     // last duty applied from D
 float extAppliedDuty = -100;   // last duty applied from external q(t)
 unsigned long lastExtReport = 0, lastDReport = 0;
+
+// Over-temperature state
+bool overTemp = false;
+int  otAboveCount = 0, otBelowCount = 0;
 
 // Capture (q(t) EXT) handles and ISR data
 mcpwm_cap_timer_handle_t   capTimer   = nullptr;
@@ -304,6 +327,14 @@ void setQRefDuty(int duty);
 bool buildQRef(uint32_t res, uint32_t base);
 void teardownQRef();
 void reportSourceState();
+void runCaptureSelfTest();
+void checkThermal();
+void enterOverTemp();
+void exitOverTemp();
+void drawOverTempScreen();
+void updateOverTempReading();
+void redrawMainScreen();
+void printCentered(const char *txt, int y, int size, uint16_t fg, uint16_t bg);
 bool IRAM_ATTR onCapRise(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u);
 bool IRAM_ATTR onCapFall(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u);
 bool newCapChannel(bool rising, mcpwm_cap_channel_handle_t *out);
@@ -583,6 +614,11 @@ void pwmSetDuty(int duty) {
 // Rebuilds only when mode or frequency changes; duty-only changes are a
 // single compare-register write.
 void applyPwm() {
+  // Over temperature: outputs stay off no matter what else asks for them.
+  if (overTemp) {
+    if (hw.built) pwmTeardown();
+    return;
+  }
   // q(t) EXT selected but no valid external signal: keep outputs off.
   if (extSource && extNoSignal) {
     if (hw.built) pwmTeardown();
@@ -712,9 +748,9 @@ float extDutyFromEdges(uint32_t riseTs, uint32_t fallTs, float ticksPerCycle) {
   return (float)(100.0 * high / ticksPerCycle);
 }
 
-// D BNC: linear map volts -> duty, clamped.
+// D BNC: linear map 0.2 V -> 5% ... 3.0 V -> 95%, clamped outside that range.
 float dDutyFromMillivolts(float mv) {
-  float frac = clampf(mv / (float)D_V_FULL_SCALE_MV, 0.0f, 1.0f);
+  float frac = clampf((mv - (float)D_V_MIN_MV) / (float)(D_V_FULL_SCALE_MV - D_V_MIN_MV), 0.0f, 1.0f);
   if (D_INVERT) frac = 1.0f - frac;
   return clampf(D_DUTY_MIN_PCT + frac * (D_DUTY_MAX_PCT - D_DUTY_MIN_PCT),
                 D_DUTY_MIN_PCT, D_DUTY_MAX_PCT);
@@ -894,6 +930,7 @@ void setDSource(bool ext) {
 
 // Duty knob push button: hold DUTY_SW_HOLD_MS to toggle the duty source.
 void pollDutyButton() {
+  if (overTemp) return;                               // controls locked
   static bool lastRaw = false, held = false;
   static unsigned long changedAt = 0;
   bool raw = (digitalRead(ENC_DUTY_SW) == LOW);
@@ -905,6 +942,35 @@ void pollDutyButton() {
   }
 }
 
+// CAPTEST: loopback check of the external-q(t) measurement path.
+// In INT mode the box drives its own q(t) on IO17, and IO18 sees the same BNC
+// net, so the capture should measure exactly the frequency/duty we set.
+// Any constant ratio between set and measured = capture clock/count error.
+void runCaptureSelfTest() {
+  if (extSource) { broadcast("INFO:captest=switch to INT first (test measures the box's own q(t))"); return; }
+  if (!hw.built || dutyCycle <= 0 || dutyCycle >= 100) {
+    broadcast("INFO:captest=set a duty between 1 and 99 % first"); return;
+  }
+  if (!startCapture()) { broadcast("INFO:captest=capture start failed"); return; }
+  delay(300 + (unsigned long)(2000.0 * EXT_CAP_PRESCALE / max(frequency, 1L)));  // >= a few capture events
+  uint32_t rise, risePrev, fall, nRise, nFall;
+  portENTER_CRITICAL(&capMux);
+  rise = capRiseTs; risePrev = capRisePrevTs; fall = capFallTs; nRise = capRiseCount; nFall = capFallCount;
+  portEXIT_CRITICAL(&capMux);
+  uint32_t res = capResHz;
+  stopCapture();
+  if (nRise < 2 || nFall < 1) {
+    broadcast("INFO:captest=no edges seen on IO18 (check R20 / the q(t) net)"); return;
+  }
+  uint32_t span = rise - risePrev;
+  float f = extFreqFromCapture(span, EXT_CAP_PRESCALE, res);
+  float d = extDutyFromEdges(rise, fall, (float)span / EXT_CAP_PRESCALE);
+  float ratio = f / (float)frequency;
+  broadcast("INFO:captest set_f=" + String(frequency) + " meas_f=" + String(f, 1) +
+            " ratio=" + String(ratio, 4) + " set_d=" + String(dutyCycle) + " meas_d=" + String(d, 1) +
+            " cap_res=" + String(res) + " span16=" + String(span));
+}
+
 void reportSourceState() {
   broadcast(extSource ? "SOURCE:EXT" : "SOURCE:INT");
   broadcast(dSourceExt ? "DSRC:EXT" : "DSRC:INT");
@@ -913,6 +979,7 @@ void reportSourceState() {
 
 // ---------------- UI & TEMP ----------------
 void drawStatusLight() {
+  if (overTemp) return;
   int x = 300, y = 20, radius = 8;
   tft.fillRect(250, 10, 70, 20, TFT_BLUE);
 
@@ -944,10 +1011,15 @@ void drawInterface() {
   tft.setCursor(10, 100);  tft.print("Freq:");
   tft.setCursor(10, 150);  tft.print("Src:");
   tft.setCursor(10, 190);  tft.print("FET2:");
-  tft.setCursor(10, 230);  tft.print("Temp:");
+
+  // Temperature lives at the bottom-right of the FET2 row (fully visible through
+  // the panel cutout). Small label above the value.
+  tft.setTextSize(1);
+  tft.setCursor(TEMP_LABEL_X, TEMP_LABEL_Y); tft.print("TEMP");
 }
 
 void updateScreenValues() {
+  if (overTemp) return;
   tft.setTextSize(2);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
@@ -963,7 +1035,7 @@ void updateScreenValues() {
   else if (dSourceExt) tft.print("INT, D=BNC");
   else                 tft.print("INTERNAL");
 
-  tft.setCursor(80, 190); tft.print("                ");
+  tft.setCursor(80, 190); tft.print("          ");   // 10 chars: longest mode name
   tft.setCursor(80, 190);
   // Legacy front-panel names (DD00003 sec. 6.2)
   if (currentMode == MODE_ALT)        tft.print("COMPL (q')");
@@ -972,6 +1044,7 @@ void updateScreenValues() {
 }
 
 void updateFreqScaleIndicator() {
+  if (overTemp) return;
   if (screenNeedsFreqModeUpdate) {
     tft.setTextSize(1);
     tft.setCursor(80, 120); 
@@ -1003,19 +1076,93 @@ void pollTemperature() {
 }
 
 void updateTempOnScreen() {
+  if (overTemp) { updateOverTempReading(); return; }
+  // Right-aligned on the FET2 row, inside the visible area of the screen.
   tft.setTextSize(2);
-  tft.setCursor(80, 230);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.print("            ");
-  tft.setCursor(80, 230);
+  tft.setCursor(TEMP_VALUE_X0, TEMP_VALUE_Y);
+  tft.print("       ");                                   // clear 7 chars (84 px)
 
+  String txt;
   if (!tempOk) {
+    txt = "ERR";
     tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.print("SENSOR ERR");
   } else {
+    txt = String(tempC, 1) + "C";                       // e.g. "23.9C", "105.2C"
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.print(tempC, 2);
-    tft.print(" C");
+  }
+  int x = TEMP_RIGHT_EDGE_X - (int)txt.length() * 12;   // size-2 glyph = 12 px wide
+  tft.setCursor(x, TEMP_VALUE_Y);
+  tft.print(txt);
+}
+
+// ---------------- OVER-TEMPERATURE ----------------
+void redrawMainScreen() {
+  tft.fillScreen(TFT_BLACK);
+  drawInterface();
+  drawStatusLight();
+  updateScreenValues();
+  screenNeedsFreqModeUpdate = true;
+  updateFreqScaleIndicator();
+  updateTempOnScreen();
+}
+
+void printCentered(const char *txt, int y, int size, uint16_t fg, uint16_t bg) {
+  tft.setTextSize(size);
+  tft.setTextColor(fg, bg);
+  int w = strlen(txt) * 6 * size;
+  tft.setCursor((320 - w) / 2, y);
+  tft.print(txt);
+}
+
+// Pop-up alert over the normal screen.
+void drawOverTempScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.fillRoundRect(16, 30, 288, 180, 12, TFT_RED);
+  tft.drawRoundRect(16, 30, 288, 180, 12, TFT_WHITE);
+  printCentered("OVER TEMP", 48, 3, TFT_WHITE, TFT_RED);
+  printCentered("Outputs OFF - cooling", 88, 2, TFT_WHITE, TFT_RED);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "Resumes below %.0f C", (double)OT_CLEAR_C);
+  printCentered(buf, 182, 1, TFT_WHITE, TFT_RED);
+  updateOverTempReading();
+}
+
+void updateOverTempReading() {
+  char buf[24];
+  if (tempOk) snprintf(buf, sizeof(buf), "  %.1f C  ", (double)tempC);
+  else        snprintf(buf, sizeof(buf), " SENSOR ERR ");
+  printCentered(buf, 128, 3, TFT_YELLOW, TFT_RED);
+}
+
+void enterOverTemp() {
+  overTemp = true;
+  otBelowCount = 0;
+  pwmTeardown();                     // FET A/B and the q(t) BNC output forced off
+  drawOverTempScreen();
+  broadcast("THERMAL:TRIP");
+  broadcast("INFO:over_temperature=" + String(tempC, 1) + "C; outputs off until below " + String(OT_CLEAR_C, 0) + "C");
+}
+
+void exitOverTemp() {
+  overTemp = false;
+  otAboveCount = 0;
+  redrawMainScreen();
+  applyPwm();                        // resume with the current settings
+  broadcast("THERMAL:OK");
+  broadcast("DUTY:" + String(dutyCycle));
+  broadcast("FREQ:" + String(frequency));
+}
+
+// Called once per temperature reading.
+void checkThermal() {
+  if (!tempOk) { otAboveCount = 0; otBelowCount = 0; return; }   // no decision on a bad read
+  if (!overTemp) {
+    if (tempC > OT_TRIP_C) { if (++otAboveCount >= OT_CONFIRM_READS) enterOverTemp(); }
+    else otAboveCount = 0;
+  } else {
+    if (tempC < OT_CLEAR_C) { if (++otBelowCount >= OT_CONFIRM_READS) exitOverTemp(); }
+    else otBelowCount = 0;
   }
 }
 
@@ -1160,6 +1307,13 @@ void parseCommand(String cmd) {
   String type = cmd.substring(0, separator);
   String val  = cmd.substring(separator + 1);
 
+  // Over temperature: read-only. Only the link commands are accepted.
+  if (overTemp && type != "CONN" && type != "HEARTBEAT") {
+    broadcast("INFO:ignored=OVER TEMPERATURE; controls locked until below " + String(OT_CLEAR_C, 0) + "C");
+    broadcast("THERMAL:TRIP");
+    return;
+  }
+
   if ((type == "DUTY" || type == "FREQ") && extSource) {
     broadcast("INFO:ignored=q(t) is EXTERNAL; freq and duty follow the external signal");
     broadcast("FREQ:" + String(frequency));
@@ -1172,6 +1326,11 @@ void parseCommand(String cmd) {
     return;
   }
   if (type == "DUTY" || type == "FREQ") outputsLatchedOff = false;
+
+  if (type == "CAPTEST") {
+    runCaptureSelfTest();
+    return;
+  }
 
   if (type == "DSRC") {
     setDSource(val == "EXT");
@@ -1212,13 +1371,9 @@ void parseCommand(String cmd) {
     isConnected = (val == "ON");
     if (isConnected) {
       lastHeartbeatTime = millis();
-      tft.fillScreen(TFT_BLACK);
-      drawInterface();
-      drawStatusLight();
-      updateScreenValues();
-      screenNeedsFreqModeUpdate = true; 
-      updateFreqScaleIndicator();
-      updateTempOnScreen();
+      if (overTemp) drawOverTempScreen();
+      else          redrawMainScreen();
+      broadcast(overTemp ? "THERMAL:TRIP" : "THERMAL:OK");
       // Tell the app what the box is actually doing (mode may come from the panel switch).
       broadcast(String("FET2:") + modeToken(currentMode));
       reportSourceState();
@@ -1291,6 +1446,7 @@ int takeDetents(volatile int32_t *steps, int32_t &residual, unsigned long &lastA
 void checkEncoders() {
   // Duty: cheap (one compare-register write), apply immediately.
   int dd = takeDetents(&dutyEncSteps, dutyEncResidual, dutyEncLastActivity, DUTY_ENC_RESIDUAL_TIMEOUT_MS);
+  if (overTemp) dd = 0;                               // over temperature: controls locked
   if (dd != 0 && (extSource || dSourceExt)) dd = 0;   // duty comes from a BNC: knob ignored
   if (dd != 0) {
     outputsLatchedOff = false;
@@ -1302,6 +1458,7 @@ void checkEncoders() {
 
   // Frequency: accumulate clicks; rebuild the PWM at most every FREQ_APPLY_MS.
   int fd = takeDetents(&freqEncSteps, freqEncResidual, freqEncLastActivity, FREQ_ENC_RESIDUAL_TIMEOUT_MS);
+  if (overTemp) fd = 0;                               // over temperature: controls locked
   if (fd != 0 && extSource) fd = 0;                  // freq follows the external q(t)
   if (fd != 0) {
     outputsLatchedOff = false;
@@ -1324,6 +1481,7 @@ void checkEncoders() {
 // bounce, and only once per press (must release for FREQ_SW_RELEASE_MS first).
 // Noise from touching the knob produces short spikes and never qualifies.
 void pollFreqButton() {
+  if (overTemp) return;                               // controls locked
   static bool lastRaw = false;      // true = LOW (pressed)
   static bool pressed = false;      // debounced state
   static unsigned long changedAt = 0;
@@ -1373,6 +1531,14 @@ void setup() {
   // D BNC: ADC1_CH3, 11/12 dB attenuation (0 - ~3.1 V), 12-bit; calibrated via analogReadMilliVolts()
   analogReadResolution(12);
   analogSetPinAttenuation(D_EXT_PIN, ADC_11db);
+  // D BNC has no pull-down on Rev 9, so an unplugged input floats and reads random
+  // voltages. Enable the internal pull-down (~45 kohm) so "nothing connected" reads
+  // ~0 V -> minimum duty. The first read attaches IO4 to the ADC; the pull is set
+  // after that so the ADC setup can't clear it. Loading error with a 50 ohm
+  // generator + R19 (100 ohm) is < 0.5%.
+  analogReadMilliVolts(D_EXT_PIN);
+  rtc_gpio_pullup_dis((gpio_num_t)D_EXT_PIN);
+  rtc_gpio_pulldown_en((gpio_num_t)D_EXT_PIN);
   // INT/EXT source switch (closes to GND)
   pinMode(SRC_SW_PIN, INPUT_PULLUP);
   delay(5);
@@ -1493,6 +1659,7 @@ void loop() {
   if (isConnected && (millis() - lastHeartbeatTime > WATCHDOG_TIMEOUT_MS)) {
     pwmSafeOff();
     isConnected = false; 
+    if (!overTemp) {
     tft.fillScreen(TFT_RED);
     tft.setTextColor(TFT_WHITE, TFT_RED);
     tft.setTextSize(3);
@@ -1501,11 +1668,13 @@ void loop() {
     tft.setTextSize(2);
     tft.setCursor(40, 150);
     tft.print("Safety Shutdown");
+    }
   }
 
   // Temperature Polling & Fan Hysteresis Control
   if (millis() - lastTempUpdate > 1000) {
     pollTemperature();
+    checkThermal();
 
     if (FAN_PIN >= 0) {
       if (tempOk && !isnan(tempC)) {
