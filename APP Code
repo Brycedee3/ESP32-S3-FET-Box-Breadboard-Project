@@ -19,7 +19,7 @@ SUPABASE_KEY = "sb_publishable_lTDc603U2Wajny-Wh4Zifw_nstCyyf1"
 ctk.set_appearance_mode("Light")
 
 # ---------------- INPUT LIMITS (keep in sync with firmware FREQ_MIN / FREQ_MAX) ----------------
-DUTY_MIN, DUTY_MAX = 0, 100
+DUTY_MIN, DUTY_MAX = 5, 100 - 5   # 5-95 %, matches firmware USER_DUTY_MIN/MAX_PCT
 FREQ_MIN_HZ, FREQ_MAX_HZ = 20, 500_000
 
 def fmt_hz(hz):
