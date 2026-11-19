@@ -3,6 +3,10 @@
 #include <Adafruit_ILI9341.h>   // Library Manager: "Adafruit ILI9341"
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include "driver/gpio.h"
+#include "driver/rmt_rx.h"
+#include "esp_attr.h"
+#include "esp_idf_version.h"
 #include "driver/mcpwm_prelude.h"   // new MCPWM driver (Arduino-ESP32 core 3.x / IDF 5.x)
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -13,6 +17,9 @@
 #include "soc/gpio_reg.h"        // fast, ISR-safe GPIO reads for the encoders
 
 // ---------------- BUILD SETTINGS CHECK ----------------
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 4, 0)
+#error "The q(t) RMT receiver needs ESP-IDF 5.4 or newer (use Arduino-ESP32 3.3.x)."
+#endif
 // Stop the build if the Arduino IDE settings are wrong for this PCB. (The IDE
 // resets these per sketch folder, which has caused "write timeout" / no-data bugs.)
 #if !defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -88,9 +95,8 @@ Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
 // No fan pin on this PCB rev. Set to a GPIO number if one is added; -1 disables fan code.
 #define FAN_PIN      -1
 
-// Reserved for features not implemented yet (external source / D input / panel switches).
-// Configured as safe inputs (or parked LOW) so they never fight the hardware.
-#define QT_INT_OUT_PIN  17  // q(t)_internal -> BNC (master output). Held HIGH-Z until implemented
+// q(t) pin directions follow the selected source.
+#define QT_INT_OUT_PIN  17  // q(t)_internal -> BNC (master output). High-Z in External.
 #define QT_EXT_IN_PIN   18  // q(t)_external  <- BNC (slave input)
 #define D_EXT_PIN        4  // D_external analog duty input (ADC1_CH3)
 
@@ -98,15 +104,19 @@ Adafruit_ILI9341 tft(&tftSPI, TFT_DC_PIN, TFT_CS_PIN, TFT_RST_PIN);
 // q(t) BNC, SLAVE (ext) mode: IO18 measures the external q(t); PWM-A/B follow it.
 #define EXT_FREQ_MIN_HZ        1000     // legacy spec 1 kHz
 #define EXT_FREQ_MAX_HZ      300000     // legacy spec 300 kHz (can raise to 500000)
+// User-set duty limits (knob, Python app, web app). Outputs can still be forced to 0
+// internally by safety features (link watchdog, over temperature, no external signal).
+#define USER_DUTY_MIN_PCT         5
+#define USER_DUTY_MAX_PCT        95
 #define EXT_DUTY_MIN_PCT          5
 #define EXT_DUTY_MAX_PCT         95
 #define EXT_NOISE_FLOOR_HZ      500     // anything slower is treated as "no signal"
 #define EXT_SIGNAL_TIMEOUT_MS   100     // no edges this long -> outputs off
-#define EXT_CAP_PRESCALE         16     // capture every 16th edge: low interrupt load at 300 kHz
 #define EXT_FREQ_HYST_PCT      0.3f     // only rebuild the timer if f moves more than this
 #define EXT_DUTY_HYST_PCT      0.75f
 #define EXT_UPDATE_MS            20
-#define EXT_CAP_GROUP             1     // capture uses MCPWM group 1; PWM-A/B use group 0
+static constexpr uint32_t EXT_RMT_HZ = 20000000;  // 50 ns ticks
+static constexpr size_t EXT_RMT_SYMBOLS = 64;    // DMA buffer, one symbol per PWM cycle
 
 // D BNC: analog voltage sets duty (when selected).
 #define D_V_MIN_MV              200     // at or below this voltage -> D_DUTY_MIN_PCT (5%)
@@ -200,16 +210,20 @@ unsigned long lastExtReport = 0, lastDReport = 0;
 bool overTemp = false;
 int  otAboveCount = 0, otBelowCount = 0;
 
-// Capture (q(t) EXT) handles and ISR data
-mcpwm_cap_timer_handle_t   capTimer   = nullptr;
-mcpwm_cap_channel_handle_t capChRise  = nullptr;
-mcpwm_cap_channel_handle_t capChFall  = nullptr;
-uint32_t capResHz = 0;
-bool capRunning = false;
-portMUX_TYPE capMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint32_t capRiseTs = 0, capRisePrevTs = 0, capFallTs = 0;
-volatile uint32_t capRiseCount = 0, capFallCount = 0;
-volatile int64_t  capLastEdgeUs = 0;
+// q(t) receiver state. The queue transfers the most recent summary from the ISR.
+struct ExtCaptureBatch {
+  uint32_t highTicks;
+  uint32_t periodTicks;
+  uint32_t cycles;
+  int64_t receivedAtUs;
+  bool last;
+};
+static rmt_channel_handle_t extRx = nullptr;
+static QueueHandle_t extRxQueue = nullptr;
+static bool extRxEnabled = false;
+alignas(64) static DMA_ATTR rmt_symbol_word_t extRxBuffer[EXT_RMT_SYMBOLS];
+static ExtCaptureBatch lastExtCapture = {};
+static bool extReportPending = false;
 
 // ---------------- ROTARY ENCODERS ----------------
 // Full quadrature decoding in interrupts on BOTH A and B edges. Every valid
@@ -314,9 +328,13 @@ int  readSourceSwitchRaw();
 void setSource(bool ext);
 void checkSourceSwitch();
 float clampf(float v, float lo, float hi);
-float extFreqFromCapture(uint32_t ticksForNCycles, uint32_t nCycles, uint32_t capResHz);
-float extDutyFromEdges(uint32_t riseTs, uint32_t fallTs, float ticksPerCycle);
 float dDutyFromMillivolts(float mv);
+static ExtCaptureBatch summarizeCapture(const rmt_symbol_word_t *symbols, size_t count);
+static bool onExtRx(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *event, void *queue);
+static esp_err_t armExtCapture();
+static bool pollExtCapture();
+static float capturedFrequency(const ExtCaptureBatch &batch);
+static float capturedDuty(const ExtCaptureBatch &batch);
 bool startCapture();
 void stopCapture();
 void serviceExtInput();
@@ -728,26 +746,6 @@ void setQRefDuty(int duty) {
 // =====================================================================
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-// Frequency from the time of N consecutive cycles (capture prescale = N).
-float extFreqFromCapture(uint32_t ticksForNCycles, uint32_t nCycles, uint32_t capResHz) {
-  if (ticksForNCycles == 0 || nCycles == 0) return 0;
-  return (float)((double)capResHz * nCycles / ticksForNCycles);
-}
-
-// Duty (%) from ANY rising-edge timestamp and ANY later-or-earlier falling-edge
-// timestamp of the same periodic signal: high time = (fall - rise) mod period.
-// Works with prescaled captures where rise and fall come from different cycles.
-float extDutyFromEdges(uint32_t riseTs, uint32_t fallTs, float ticksPerCycle) {
-  if (ticksPerCycle <= 0) return 0;
-  // Signed difference: the latest fall may be before OR after the latest rise.
-  // (Unsigned would wrap to ~2^32, which is not a multiple of the period.)
-  // Valid while |fall - rise| < 2^31 ticks (~26 s at 80 MHz).
-  int32_t d = (int32_t)(fallTs - riseTs);
-  double high = fmod((double)d, (double)ticksPerCycle);
-  if (high < 0) high += ticksPerCycle;
-  return (float)(100.0 * high / ticksPerCycle);
-}
-
 // D BNC: linear map 0.2 V -> 5% ... 3.0 V -> 95%, clamped outside that range.
 float dDutyFromMillivolts(float mv) {
   float frac = clampf((mv - (float)D_V_MIN_MV) / (float)(D_V_FULL_SCALE_MV - D_V_MIN_MV), 0.0f, 1.0f);
@@ -756,103 +754,157 @@ float dDutyFromMillivolts(float mv) {
                 D_DUTY_MIN_PCT, D_DUTY_MAX_PCT);
 }
 
-// =====================================================================
-// q(t) EXTERNAL INPUT (IO18, slave/ext mode) via MCPWM capture (group 1)
-// Two capture channels on the same pin: every 16th rising edge and every 16th
-// falling edge. Period = (rise - previous rise)/16; duty from the rise/fall
-// offset modulo the period. Interrupt rate stays <= ~40 kHz even at 300 kHz.
-// PWM-A/B FOLLOW the external frequency and duty through the normal mode logic.
-// They are frequency-matched, not phase-locked (see notes).
-// =====================================================================
-bool IRAM_ATTR onCapRise(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u) {
-  portENTER_CRITICAL_ISR(&capMux);
-  capRisePrevTs = capRiseTs;
-  capRiseTs     = e->cap_value;
-  capRiseCount++;
-  capLastEdgeUs = esp_timer_get_time();
-  portEXIT_CRITICAL_ISR(&capMux);
-  return false;
+// q(t) external input on GPIO18. RMT records pulse durations into a DMA buffer.
+// Reduce a completed block to a small summary before the driver reuses it.
+static ExtCaptureBatch IRAM_ATTR summarizeCapture(const rmt_symbol_word_t *symbols, size_t count) {
+  ExtCaptureBatch batch = {};
+  if (count < 5) return batch;
+
+  // Use complete cycles near the end, away from possible start/stop fragments.
+  const size_t end = count - 1;
+  const size_t start = end > 12 ? end - 12 : 1;
+  uint32_t shortest = UINT32_MAX;
+  uint32_t longest = 0;
+  for (size_t i = start; i < end; ++i) {
+    const rmt_symbol_word_t symbol = symbols[i];
+    if (!symbol.duration0 || !symbol.duration1 || symbol.level0 == symbol.level1) continue;
+    const uint32_t period = uint32_t(symbol.duration0) + symbol.duration1;
+    shortest = period < shortest ? period : shortest;
+    longest = period > longest ? period : longest;
+    batch.highTicks += symbol.level0 ? symbol.duration0 : symbol.duration1;
+    batch.periodTicks += period;
+    ++batch.cycles;
+  }
+  // Reject batches spanning a frequency step. Allow two ticks of quantization.
+  if (batch.cycles < 3 || uint32_t(longest - shortest) > 2U + shortest / 33U) {
+    batch.cycles = 0;
+  }
+  return batch;
 }
 
-bool IRAM_ATTR onCapFall(mcpwm_cap_channel_handle_t ch, const mcpwm_capture_event_data_t *e, void *u) {
-  portENTER_CRITICAL_ISR(&capMux);
-  capFallTs = e->cap_value;
-  capFallCount++;
-  portEXIT_CRITICAL_ISR(&capMux);
-  return false;
+static bool IRAM_ATTR onExtRx(rmt_channel_handle_t, const rmt_rx_done_event_data_t *event, void *queue) {
+  ExtCaptureBatch batch = {};
+  if (event->num_symbols >= 5) {
+    batch = summarizeCapture(event->received_symbols, event->num_symbols);
+    if (batch.cycles) batch.receivedAtUs = esp_timer_get_time();
+  }
+  batch.last = event->flags.is_last;
+  if (!batch.last && !batch.cycles) return false;
+
+  BaseType_t shouldWake = pdFALSE;
+  xQueueOverwriteFromISR(static_cast<QueueHandle_t>(queue), &batch, &shouldWake);
+  return shouldWake == pdTRUE;
 }
 
-bool newCapChannel(bool rising, mcpwm_cap_channel_handle_t *out) {
-  mcpwm_capture_channel_config_t cc = {};
-  cc.gpio_num        = QT_EXT_IN_PIN;
-  cc.prescale        = EXT_CAP_PRESCALE;
-  cc.flags.pos_edge  = rising;
-  cc.flags.neg_edge  = !rising;
-  cc.flags.pull_down = true;   // nothing plugged in -> line held low -> no edges -> safe timeout
-  MC_CHECK(mcpwm_new_capture_channel(capTimer, &cc, out));
-  mcpwm_capture_event_callbacks_t cb = {};
-  cb.on_cap = rising ? onCapRise : onCapFall;
-  MC_CHECK(mcpwm_capture_channel_register_event_callbacks(*out, &cb, nullptr));
-  MC_CHECK(mcpwm_capture_channel_enable(*out));
-  return true;
+static esp_err_t armExtCapture() {
+  rmt_receive_config_t config = {};
+  config.signal_range_min_ns = 0;
+  config.signal_range_max_ns = 1500000;  // 1.5 ms covers both pulse levels at 1 kHz.
+  config.flags.en_partial_rx = true;    // Continuous PWM has no natural frame end.
+  return rmt_receive(extRx, extRxBuffer, sizeof(extRxBuffer), &config);
 }
 
 bool startCapture() {
-  if (capRunning) return true;
-  portENTER_CRITICAL(&capMux);
-  capRiseTs = capRisePrevTs = capFallTs = 0;
-  capRiseCount = capFallCount = 0;
-  capLastEdgeUs = 0;
-  portEXIT_CRITICAL(&capMux);
+  if (extRx) return false;
+  if (!extRxQueue) extRxQueue = xQueueCreate(1, sizeof(ExtCaptureBatch));
+  if (!extRxQueue) {
+    Serial.println("EXT: RMT queue allocation failed");
+    return false;
+  }
+  xQueueReset(extRxQueue);
+  lastExtCapture = {};
 
-  mcpwm_capture_timer_config_t tc = {};
-  tc.group_id = EXT_CAP_GROUP;
-  tc.clk_src  = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
-  MC_CHECK(mcpwm_new_capture_timer(&tc, &capTimer));
-  MC_CHECK(mcpwm_capture_timer_get_resolution(capTimer, &capResHz));
-  if (!newCapChannel(true,  &capChRise)) { stopCapture(); return false; }
-  if (!newCapChannel(false, &capChFall)) { stopCapture(); return false; }
-  MC_CHECK(mcpwm_capture_timer_enable(capTimer));
-  MC_CHECK(mcpwm_capture_timer_start(capTimer));
-  capRunning = true;
-  Serial.printf("EXT: capture on IO%d, %lu Hz timer, prescale %d\n",
-                QT_EXT_IN_PIN, (unsigned long)capResHz, EXT_CAP_PRESCALE);
+  rmt_rx_channel_config_t config = {};
+  config.gpio_num = static_cast<gpio_num_t>(QT_EXT_IN_PIN);
+  config.clk_src = RMT_CLK_SRC_APB;
+  config.resolution_hz = EXT_RMT_HZ;
+  config.mem_block_symbols = EXT_RMT_SYMBOLS;
+  config.flags.with_dma = true;
+  rmt_rx_event_callbacks_t callbacks = {};
+  callbacks.on_recv_done = onExtRx;
+
+  esp_err_t error = rmt_new_rx_channel(&config, &extRx);
+  if (error == ESP_OK) error = gpio_pulldown_en(config.gpio_num);
+  if (error == ESP_OK) error = rmt_rx_register_event_callbacks(extRx, &callbacks, extRxQueue);
+  if (error == ESP_OK) {
+    error = rmt_enable(extRx);
+    extRxEnabled = error == ESP_OK;
+  }
+  if (error == ESP_OK) error = armExtCapture();
+  if (error != ESP_OK) {
+    Serial.printf("EXT: RMT start failed: %s\n", esp_err_to_name(error));
+    stopCapture();
+    return false;
+  }
+  Serial.printf("EXT: RMT RX DMA on IO%d, %lu Hz resolution\n",
+                QT_EXT_IN_PIN, static_cast<unsigned long>(EXT_RMT_HZ));
   return true;
 }
 
 void stopCapture() {
-  if (capTimer && capRunning) {
-    mcpwm_capture_timer_stop(capTimer);
-    mcpwm_capture_timer_disable(capTimer);
+  lastExtCapture = {};
+  extReportPending = false;
+  if (extRx) {
+    if (extRxEnabled) {
+      const esp_err_t error = rmt_disable(extRx);
+      if (error != ESP_OK) {
+        Serial.printf("EXT: RMT disable failed: %s\n", esp_err_to_name(error));
+        return;
+      }
+      extRxEnabled = false;
+    }
+    const esp_err_t error = rmt_del_channel(extRx);
+    if (error != ESP_OK) {
+      Serial.printf("EXT: RMT release failed: %s\n", esp_err_to_name(error));
+      return;
+    }
+    extRx = nullptr;
   }
-  if (capChRise) { mcpwm_capture_channel_disable(capChRise); mcpwm_del_capture_channel(capChRise); capChRise = nullptr; }
-  if (capChFall) { mcpwm_capture_channel_disable(capChFall); mcpwm_del_capture_channel(capChFall); capChFall = nullptr; }
-  if (capTimer)  { mcpwm_del_capture_timer(capTimer); capTimer = nullptr; }
-  capRunning = false;
+  if (extRxQueue) xQueueReset(extRxQueue);
   pinMode(QT_EXT_IN_PIN, INPUT);
+}
+
+static bool pollExtCapture() {
+  if (!extRxEnabled) return false;
+  ExtCaptureBatch batch;
+  if (xQueueReceive(extRxQueue, &batch, 0) != pdTRUE) return true;
+
+  // A real frame end means an idle interval. Start a fresh receive transaction.
+  if (batch.last) {
+    const esp_err_t error = armExtCapture();
+    if (error != ESP_OK) {
+      Serial.printf("EXT: RMT rearm failed: %s\n", esp_err_to_name(error));
+      stopCapture();
+      return false;
+    }
+  }
+  if (batch.cycles) lastExtCapture = batch;
+  return true;
+}
+
+static float capturedFrequency(const ExtCaptureBatch &batch) {
+  return (static_cast<float>(EXT_RMT_HZ) * batch.cycles) / batch.periodTicks;
+}
+
+static float capturedDuty(const ExtCaptureBatch &batch) {
+  return (100.0f * batch.highTicks) / batch.periodTicks;
 }
 
 void serviceExtInput() {
   static unsigned long lastRun = 0;
-  if (!extSource || !capRunning) return;
-  unsigned long nowMs = millis();
-  if (nowMs - lastRun < EXT_UPDATE_MS) return;
+  if (!extSource) return;
+  const bool receiverActive = pollExtCapture();
+  const unsigned long nowMs = millis();
+  if (receiverActive && nowMs - lastRun < EXT_UPDATE_MS) return;
   lastRun = nowMs;
 
-  uint32_t rise, risePrev, fall, nRise, nFall; int64_t lastEdge;
-  portENTER_CRITICAL(&capMux);
-  rise = capRiseTs; risePrev = capRisePrevTs; fall = capFallTs;
-  nRise = capRiseCount; nFall = capFallCount; lastEdge = capLastEdgeUs;
-  portEXIT_CRITICAL(&capMux);
-
-  bool valid = (nRise >= 2 && nFall >= 1 &&
-                esp_timer_get_time() - lastEdge < (int64_t)EXT_SIGNAL_TIMEOUT_MS * 1000);
   float f = 0, d = 0;
+  bool valid = receiverActive && lastExtCapture.cycles &&
+               esp_timer_get_time() - lastExtCapture.receivedAtUs < int64_t(EXT_SIGNAL_TIMEOUT_MS) * 1000;
   if (valid) {
-    uint32_t span = rise - risePrev;                  // ticks for EXT_CAP_PRESCALE cycles
-    f = extFreqFromCapture(span, EXT_CAP_PRESCALE, capResHz);
-    d = extDutyFromEdges(rise, fall, (float)span / EXT_CAP_PRESCALE);
-    if (f < EXT_NOISE_FLOOR_HZ) valid = false;
+    f = capturedFrequency(lastExtCapture);
+    d = capturedDuty(lastExtCapture);
+    valid = f >= EXT_NOISE_FLOOR_HZ;
   }
 
   if (!valid) {
@@ -860,6 +912,7 @@ void serviceExtInput() {
       extNoSignal = true;
       pwmTeardown();                                  // outputs forced low
       extAppliedDuty = -100;
+      extReportPending = false;
       updateScreenValues();
       broadcast("INFO:ext=NO_SIGNAL");
     }
@@ -875,15 +928,17 @@ void serviceExtInput() {
   bool fChange = wasNoSignal || frequency <= 0 ||
                  fabsf(fC - (float)frequency) * 100.0f / (float)frequency > EXT_FREQ_HYST_PCT;
   bool dChange = wasNoSignal || fabsf(dC - extAppliedDuty) >= EXT_DUTY_HYST_PCT;
-  if (!fChange && !dChange) return;
-
-  if (fChange) frequency = lroundf(fC);
-  extAppliedDuty = dC;
-  dutyCycle = lroundf(dC);
-  applyPwm();
+  if (fChange || dChange) {
+    if (fChange) frequency = lroundf(fC);
+    extAppliedDuty = dC;
+    dutyCycle = lroundf(dC);
+    applyPwm();
+    extReportPending = true;
+  }
 
   if (wasNoSignal) broadcast("INFO:ext=LOCKED");
-  if (wasNoSignal || nowMs - lastExtReport >= 250) {
+  if (extReportPending && (wasNoSignal || nowMs - lastExtReport >= 250)) {
+    extReportPending = false;
     lastExtReport = nowMs;
     updateScreenValues();
     broadcast("FREQ:" + String(frequency));
@@ -952,23 +1007,23 @@ void runCaptureSelfTest() {
     broadcast("INFO:captest=set a duty between 1 and 99 % first"); return;
   }
   if (!startCapture()) { broadcast("INFO:captest=capture start failed"); return; }
-  delay(300 + (unsigned long)(2000.0 * EXT_CAP_PRESCALE / max(frequency, 1L)));  // >= a few capture events
-  uint32_t rise, risePrev, fall, nRise, nFall;
-  portENTER_CRITICAL(&capMux);
-  rise = capRiseTs; risePrev = capRisePrevTs; fall = capFallTs; nRise = capRiseCount; nFall = capFallCount;
-  portEXIT_CRITICAL(&capMux);
-  uint32_t res = capResHz;
-  stopCapture();
-  if (nRise < 2 || nFall < 1) {
-    broadcast("INFO:captest=no edges seen on IO18 (check R20 / the q(t) net)"); return;
+  const unsigned long started = millis();
+  while (!lastExtCapture.cycles && millis() - started < 300) {
+    if (!pollExtCapture()) break;
+    delay(1);
   }
-  uint32_t span = rise - risePrev;
-  float f = extFreqFromCapture(span, EXT_CAP_PRESCALE, res);
-  float d = extDutyFromEdges(rise, fall, (float)span / EXT_CAP_PRESCALE);
-  float ratio = f / (float)frequency;
+  const ExtCaptureBatch result = lastExtCapture;
+  stopCapture();
+  if (!result.cycles) {
+    broadcast("INFO:captest=no PWM measured on IO18 (check R20 / the q(t) net)");
+    return;
+  }
+  const float f = capturedFrequency(result);
+  const float d = capturedDuty(result);
+  const float ratio = f / static_cast<float>(frequency);
   broadcast("INFO:captest set_f=" + String(frequency) + " meas_f=" + String(f, 1) +
             " ratio=" + String(ratio, 4) + " set_d=" + String(dutyCycle) + " meas_d=" + String(d, 1) +
-            " cap_res=" + String(res) + " span16=" + String(span));
+            " cap_res=" + String(EXT_RMT_HZ) + " cycles=" + String(result.cycles));
 }
 
 void reportSourceState() {
@@ -1240,8 +1295,7 @@ int readSourceSwitchRaw() {
 }
 
 // Single path for every source change (panel switch or app), so the screen
-// and both apps always agree. NOTE: the external q(t) input itself is not
-// implemented yet; this only records and reports the selection.
+// and both apps always agree.
 void setSource(bool ext) {
   // Any int/ext change: force PWM-A/B low, reconfigure IO17/IO18 and the timer
   // source, then release.
@@ -1338,7 +1392,7 @@ void parseCommand(String cmd) {
   }
 
   if (type == "DUTY") {
-    dutyCycle = constrain(val.toInt(), 0, 100);
+    dutyCycle = constrain(val.toInt(), USER_DUTY_MIN_PCT, USER_DUTY_MAX_PCT);
     applyPwm();
     updateScreenValues();
     Serial.print("DUTY:"); Serial.println(dutyCycle);
@@ -1450,7 +1504,7 @@ void checkEncoders() {
   if (dd != 0 && (extSource || dSourceExt)) dd = 0;   // duty comes from a BNC: knob ignored
   if (dd != 0) {
     outputsLatchedOff = false;
-    dutyCycle = constrain(dutyCycle + dd * DUTY_ENC_DIR, 0, 100);
+    dutyCycle = constrain(dutyCycle + dd * DUTY_ENC_DIR, USER_DUTY_MIN_PCT, USER_DUTY_MAX_PCT);
     applyPwm();
     updateScreenValues();
     broadcast("DUTY:" + String(dutyCycle));
@@ -1522,10 +1576,7 @@ void setup() {
     digitalWrite(FAN_PIN, LOW);
   }
 
-  // Reserved pins: park in a safe state until their features exist.
-  // IO17 shares the q(t) BNC with IO18 through only R17 = 47 ohm. Driving it would
-  // fight any external generator plugged into that BNC, so keep it high-Z (input,
-  // no pull) until the q(t) output feature is implemented.
+  // Leave the shared q(t) BNC high impedance until the input source is resolved.
   pinMode(QT_INT_OUT_PIN, INPUT);
   pinMode(QT_EXT_IN_PIN, INPUT);
   // D BNC: ADC1_CH3, 11/12 dB attenuation (0 - ~3.1 V), 12-bit; calibrated via analogReadMilliVolts()
