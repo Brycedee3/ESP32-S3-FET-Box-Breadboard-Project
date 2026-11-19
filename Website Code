@@ -222,7 +222,7 @@
             <div class="section-title">CONTROLS</div>
             
             <div class="control-label">Set Duty Cycle (%)</div>
-            <input type="number" id="dutyInput" placeholder="e.g., 50" min="0" max="100">
+            <input type="number" id="dutyInput" placeholder="e.g., 50" min="5" max="95">
             <div class="input-error" id="dutyError"></div>
             <button id="sendDutyBtn" class="action-btn">Send Duty</button>
             
@@ -607,7 +607,7 @@
         freqInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendFreqBtn.click(); });
 
         // ---------- INPUT VALIDATION (keep limits in sync with firmware FREQ_MIN / FREQ_MAX) ----------
-        const DUTY_MIN = 0, DUTY_MAX = 100;
+        const DUTY_MIN = 5, DUTY_MAX = 95;   // matches firmware USER_DUTY_MIN/MAX_PCT
         const FREQ_MIN_HZ = 20, FREQ_MAX_HZ = 500000;
         const dutyError = document.getElementById('dutyError');
         const freqError = document.getElementById('freqError');
